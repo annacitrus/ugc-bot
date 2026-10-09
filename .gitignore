@@ -6,3 +6,6 @@ __pycache__/
 *.sqlite3
 *.sqlite3-*
 .pytest_cache/
+cloudflare-tunnel.token
+/tools/cloudflared.exe
+/tools/cloudflared.exe.download

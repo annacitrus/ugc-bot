@@ -47,6 +47,7 @@ class UploadBot(discord.Client):
         )
         app = web.Application()
         app.router.add_get("/oauth/callback", self.oauth_callback)
+        app.router.add_get("/healthz", lambda _: web.Response(text="ok"))
         self.web_runner = web.AppRunner(app)
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, self.config.http_host, self.config.http_port)
@@ -129,10 +130,15 @@ class UploadBot(discord.Client):
         return tokens["access_token"]
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or self.user is None or self.user not in message.mentions:
+        if message.author.bot or self.user is None:
             return
-        if len(message.attachments) != 1:
-            await message.reply("Attach exactly one MP4, MOV, or WebM video with the mention.", mention_author=False)
+        if message.guild is not None and self.user not in message.mentions:
+            return
+        if not message.attachments:
+            await message.reply("You need to attach a video file for uploads to work.", mention_author=False)
+            return
+        if len(message.attachments) > 1:
+            await message.reply("Attach exactly one MP4, MOV, or WebM video.", mention_author=False)
             return
         attachment = message.attachments[0]
         suffix = Path(attachment.filename).suffix.lower()
