@@ -1,8 +1,8 @@
 # Discord → TikTok video uploader
 
-Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. A normal message sends the file to your TikTok inbox, where you finish editing and publishing. Without an attachment, the bot replies with an upload instruction. Send `@Bot post this` with one video to open a direct-post panel in Discord; choose the post's privacy and other options, then press **Post now** or **Schedule post**. Direct posts do not require the TikTok inbox step.
+Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. The bot opens a posting panel where you choose privacy and other options, then press **Post now** or **Schedule post**. The video is sent to TikTok only after you choose one of those actions.
 
-Each Discord user connects their own TikTok account with `/link-tiktok` for inbox uploads and direct posts. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
+Each Discord user connects their own TikTok account with `/link-tiktok`. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
 
 ## Set up
 
@@ -29,7 +29,7 @@ Each Discord user connects their own TikTok account with `/link-tiktok` for inbo
    python -m ugc_bot.bot
    ```
 
-6. In Discord, run `/link-tiktok` and authorize both `video.upload` and `video.publish` through the private link. Then send a message that @mentions the bot and attaches a video for an inbox upload. For scheduling, run `/set-time-zone` with your IANA time zone, for example `America/Indianapolis`. To post directly, send a video with exactly `post this` after the mention (for example, `@Bot post this`). The bot opens a panel for privacy, caption, interaction and commercial disclosure choices. Press **Post now** to submit immediately, or **Schedule post** to choose a future time. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
+6. In Discord, run `/link-tiktok` and authorize both `video.upload` and `video.publish` through the private link. For scheduling, run `/set-time-zone` with your IANA time zone, for example `America/Indianapolis`. Then @mention the bot with one video attachment, or DM the video to it. The bot opens a panel for privacy, caption, interaction and commercial disclosure choices. Press **Post now** to submit immediately, or **Schedule post** to choose a future time. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
 
 ### Scheduled posts
 
@@ -89,6 +89,6 @@ Cloudflare's [tunnel setup](https://developers.cloudflare.com/tunnel/get-started
 
 ## TikTok limits
 
-TikTok's Upload API sends videos to the creator's inbox for completion in the TikTok app. TikTok limits pending shares (currently up to five in a 24-hour period) and video length (up to ten minutes for this API). The app requires a TikTok developer configuration and permission for `video.upload`; TikTok may reject a developer app or restrict access based on its product guidelines. Direct posting uses the separate `video.publish` scope and follows TikTok's per-post privacy and consent requirements. Existing upload-only connections must reauthorize with `/link-tiktok` to post directly. **Unaudited apps can only post privately (`SELF_ONLY`) and only to private creator accounts**; public posting requires TikTok audit approval. The Direct Post API also has daily posting caps.
+The app requests `video.upload` and `video.publish` during `/link-tiktok` authorization. Posting through the bot uses TikTok's Direct Post API and follows TikTok's per-post privacy and consent requirements. Existing upload-only connections must reauthorize with `/link-tiktok` to post. **Unaudited apps can only post privately (`SELF_ONLY`) and only to private creator accounts**; public posting requires TikTok audit approval. The Direct Post API also has daily posting caps.
 
 Official references: [Upload API](https://developers.tiktok.com/docs/en/content-posting-api-reference-upload-video), [Direct Post API](https://developers.tiktok.com/docs/en/content-posting-api-reference-direct-post), [content sharing guidelines](https://developers.tiktok.com/docs/en/content-sharing-guidelines), [media transfer rules](https://developers.tiktok.com/docs/en/content-posting-api-media-transfer-guide), [Login Kit](https://developers.tiktok.com/docs/en/login-kit-web), [token management](https://developers.tiktok.com/docs/en/oauth-user-access-token-management), [Discord mention access](https://support-dev.discord.com/hc/en-us/articles/6383579033751-Message-Content-Intent-Alternatives-Workarounds).

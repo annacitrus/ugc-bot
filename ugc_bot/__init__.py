@@ -1,1 +1,1 @@
-"""Discord to TikTok inbox uploader."""
+"""Discord to TikTok video posting bot."""

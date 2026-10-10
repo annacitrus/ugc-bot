@@ -5,11 +5,11 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from cryptography.fernet import Fernet
 
-from ugc_bot.bot import CaptionModal, DirectPostView, ScheduleModal, UploadBot, is_direct_post_request, parse_schedule_time
+from ugc_bot.bot import CaptionModal, DirectPostView, ScheduleModal, UploadBot, parse_schedule_time
 from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, TikTokError, authorization_url, chunk_ranges
@@ -182,6 +182,47 @@ class BotStartupTests(unittest.TestCase):
             finally:
                 bot.storage.close()
 
+    def test_video_attachment_opens_posting_options_without_uploading(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            config = Config(
+                discord_token="test",
+                tiktok_client_key="test",
+                tiktok_client_secret="test",
+                tiktok_redirect_uri="https://bot.up.railway.app/oauth/callback",
+                encryption_key=Fernet.generate_key(),
+                database_path=Path(directory) / "bot.sqlite3",
+                http_host="127.0.0.1",
+                http_port=8080,
+                discord_guild_id=None,
+                max_video_bytes=100_000_000,
+            )
+            bot = UploadBot(config)
+            bot.storage.save_tokens(123, {"scope": "video.upload,video.publish"})
+            bot.tiktok = SimpleNamespace(
+                creator_info=AsyncMock(return_value={"privacy_level_options": ["SELF_ONLY"]}),
+                upload_video=AsyncMock(),
+                post_video=AsyncMock(),
+            )
+            message = SimpleNamespace(
+                author=SimpleNamespace(id=123, bot=False),
+                guild=None,
+                attachments=[SimpleNamespace(filename="clip.mp4", size=1024)],
+                reply=AsyncMock(),
+            )
+            try:
+                with patch.object(UploadBot, "user", new_callable=PropertyMock, return_value=SimpleNamespace(id=999)):
+                    with patch.object(bot, "_access_token", new=AsyncMock(return_value="access")):
+                        run_fake_coroutine(bot.on_message(message))
+                message.reply.assert_awaited_once()
+                response = message.reply.await_args
+                self.assertIn("Post now", response.args[0])
+                self.assertIn("Schedule post", response.args[0])
+                self.assertIsInstance(response.kwargs["view"], DirectPostView)
+                bot.tiktok.upload_video.assert_not_awaited()
+                bot.tiktok.post_video.assert_not_awaited()
+            finally:
+                bot.storage.close()
+
 
 class TikTokValueTests(unittest.TestCase):
     def test_schedule_time_uses_saved_zone_and_handles_clock_changes(self):
@@ -222,13 +263,6 @@ class TikTokValueTests(unittest.TestCase):
         url = authorization_url("key", "https://example.com/oauth/callback", "random-state")
         self.assertIn("scope=video.upload%2Cvideo.publish", url)
         self.assertIn("state=random-state", url)
-
-    def test_direct_post_phrase_must_be_exact(self):
-        self.assertTrue(is_direct_post_request("<@123> post this", 123))
-        self.assertTrue(is_direct_post_request("post this <@!123>", 123))
-        self.assertFalse(is_direct_post_request("<@123> please post this", 123))
-        self.assertFalse(is_direct_post_request("<@123> Post this", 123))
-        self.assertFalse(is_direct_post_request("<@123> post this later", 123))
 
     def test_new_link_requires_both_scopes_but_legacy_refresh_allows_upload_only(self):
         class TokenSession:

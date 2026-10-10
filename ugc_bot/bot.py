@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import secrets
 import tempfile
 import time
@@ -23,10 +22,6 @@ from .tiktok import MIME_TYPES, TikTokAPI, TikTokError, authorization_url
 
 
 log = logging.getLogger(__name__)
-
-
-def is_direct_post_request(content: str, bot_id: int) -> bool:
-    return re.sub(rf"<@!?{bot_id}>", "", content).strip() == "post this"
 
 
 def load_time_zone(name: str) -> ZoneInfo:
@@ -370,12 +365,12 @@ class UploadBot(discord.Client):
         await super().close()
 
     def _register_commands(self) -> None:
-        @self.tree.command(name="link-tiktok", description="Connect TikTok for inbox uploads and direct posts")
+        @self.tree.command(name="link-tiktok", description="Connect TikTok for posting and scheduling videos")
         async def link_tiktok(interaction: discord.Interaction) -> None:
             state = self.storage.new_state(interaction.user.id)
             url = authorization_url(self.config.tiktok_client_key, self.config.tiktok_redirect_uri, state)
             await interaction.response.send_message(
-                "Connect your TikTok account for uploads and direct posts "
+                "Connect your TikTok account for direct posts and scheduling "
                 "(link expires in 10 minutes):\n" + url
                 + "\nTo schedule in your local time, set it with `/set-time-zone` "
                   "(for example `America/Indianapolis`).",
@@ -504,16 +499,15 @@ class UploadBot(discord.Client):
         if message.guild is not None and self.user not in message.mentions:
             return
         if not message.attachments:
-            await message.reply("You need to attach a video file for uploads to work.", mention_author=False)
+            await message.reply("Attach one video to choose Post now or Schedule post.", mention_author=False)
             return
         if len(message.attachments) > 1:
             await message.reply("Attach exactly one MP4, MOV, or WebM video.", mention_author=False)
             return
         attachment = message.attachments[0]
         suffix = Path(attachment.filename).suffix.lower()
-        mime_type = MIME_TYPES.get(suffix)
-        if not mime_type:
-            await message.reply("I can upload MP4, MOV, or WebM video files.", mention_author=False)
+        if suffix not in MIME_TYPES:
+            await message.reply("Attach an MP4, MOV, or WebM video file.", mention_author=False)
             return
         if attachment.size <= 0 or attachment.size > self.config.max_video_bytes:
             limit = self.config.max_video_bytes // 1_000_000
@@ -523,82 +517,40 @@ class UploadBot(discord.Client):
             await message.reply("Run `/link-tiktok` to connect your TikTok account first.", mention_author=False)
             return
 
-        if is_direct_post_request(message.content, self.user.id):
-            tokens = self.storage.get_tokens(message.author.id)
-            if "video.publish" not in {scope.strip() for scope in tokens.get("scope", "").split(",")}:
-                await message.reply(
-                    "Direct posting needs TikTok's `video.publish` permission. Run `/link-tiktok` again.",
-                    mention_author=False,
-                )
-                return
-            try:
-                token = await self._access_token(message.author.id)
-                assert self.tiktok is not None
-                creator = await self.tiktok.creator_info(token)
-                view = DirectPostView(self, message, creator)
-            except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                await message.reply(f"Could not prepare a direct post: {exc}", mention_author=False)
-                return
-            account = creator.get("creator_nickname") or creator.get("creator_username") or "your TikTok account"
-            saved_zone = self.storage.get_time_zone(message.author.id)
-            schedule_hint = (
-                f"Scheduling time zone: `{time_zone_display(saved_zone)}`. "
-                "Use `/set-time-zone` if it is wrong."
-                if saved_zone else
-                "Scheduling time zone: not set. Enter a UTC offset or use `/set-time-zone` first."
-            )
+        tokens = self.storage.get_tokens(message.author.id)
+        if "video.publish" not in {scope.strip() for scope in tokens.get("scope", "").split(",")}:
             await message.reply(
-                f"Post **{attachment.filename}** to **{account}**. Choose privacy, review the options, "
-                "then choose **Post now** or **Schedule post**. By posting, you agree to TikTok's "
-                "[Music Usage Confirmation](https://www.tiktok.com/legal/page/global/music-usage-confirmation/en). "
-                "For branded content, you also agree to TikTok's "
-                "[Branded Content Policy](https://www.tiktok.com/legal/page/global/bc-policy/en). "
-                "Unaudited apps can only post privately to private TikTok accounts. "
-                "The video may take a few minutes to appear on your profile.\n" + schedule_hint,
+                "Direct posting needs TikTok's `video.publish` permission. Run `/link-tiktok` again.",
                 mention_author=False,
-                view=view,
             )
             return
-
-        async with self.upload_slots, self._lock(message.author.id):
-            progress = await message.reply("Downloading and uploading your video to TikTok…", mention_author=False)
-            try:
-                token = await self._access_token(message.author.id)
-                with tempfile.TemporaryDirectory(prefix="ugc-bot-") as directory:
-                    path = Path(directory) / ("video" + suffix)
-                    await self._download(attachment, path)
-                    assert self.tiktok is not None
-                    publish_id = await self.tiktok.upload_video(token, path, mime_type)
-                await progress.edit(content="Video transferred. Waiting for TikTok to process it…")
-                for _ in range(20):
-                    await asyncio.sleep(3)
-                    try:
-                        status = await self.tiktok.status(token, publish_id)
-                    except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError):
-                        log.warning("TikTok status check failed for Discord user %s", message.author.id)
-                        await progress.edit(
-                            content="Video transferred to TikTok, but I could not confirm processing. "
-                            "Check your TikTok inbox shortly."
-                        )
-                        return
-                    state = status.get("status")
-                    if state == "SEND_TO_USER_INBOX":
-                        await progress.edit(content="Uploaded! Open your TikTok inbox notification to edit and publish the video.")
-                        return
-                    if state == "PUBLISH_COMPLETE":
-                        await progress.edit(content="Uploaded and published on TikTok.")
-                        return
-                    if state == "FAILED":
-                        reason = status.get("fail_reason", "unknown")
-                        raise TikTokError(f"TikTok could not process the video: {reason}")
-                await progress.edit(
-                    content="Video transferred to TikTok, but processing is still pending. Check your TikTok inbox shortly."
-                )
-            except TikTokError as exc:
-                await progress.edit(content=str(exc))
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                log.exception("Video upload failed for Discord user %s", message.author.id)
-                await progress.edit(content="Upload failed due to a network or file error. Please try again.")
+        try:
+            token = await self._access_token(message.author.id)
+            assert self.tiktok is not None
+            creator = await self.tiktok.creator_info(token)
+            view = DirectPostView(self, message, creator)
+        except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            await message.reply(f"Could not prepare a direct post: {exc}", mention_author=False)
+            return
+        account = creator.get("creator_nickname") or creator.get("creator_username") or "your TikTok account"
+        saved_zone = self.storage.get_time_zone(message.author.id)
+        schedule_hint = (
+            f"Scheduling time zone: `{time_zone_display(saved_zone)}`. "
+            "Use `/set-time-zone` if it is wrong."
+            if saved_zone else
+            "Scheduling time zone: not set. Enter a UTC offset or use `/set-time-zone` first."
+        )
+        await message.reply(
+            f"Post **{attachment.filename}** to **{account}**. Choose privacy, review the options, "
+            "then choose **Post now** or **Schedule post**. By posting, you agree to TikTok's "
+            "[Music Usage Confirmation](https://www.tiktok.com/legal/page/global/music-usage-confirmation/en). "
+            "For branded content, you also agree to TikTok's "
+            "[Branded Content Policy](https://www.tiktok.com/legal/page/global/bc-policy/en). "
+            "Unaudited apps can only post privately to private TikTok accounts. "
+            "The video may take a few minutes to appear on your profile.\n" + schedule_hint,
+            mention_author=False,
+            view=view,
+        )
 
     async def post_direct_video(
         self, progress: discord.Message, message: discord.Message, settings: DirectPostView
