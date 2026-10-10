@@ -1,6 +1,6 @@
 # Discord → TikTok video uploader
 
-Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. A normal message sends the file to your TikTok inbox, where you finish editing and publishing. Without an attachment, the bot replies with an upload instruction. Send `@Bot post this` with one video to open a direct-post panel in Discord; choose the post's privacy and other options, then press **Post to TikTok**. Direct posts do not require the TikTok inbox step.
+Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. A normal message sends the file to your TikTok inbox, where you finish editing and publishing. Without an attachment, the bot replies with an upload instruction. Send `@Bot post this` with one video to open a direct-post panel in Discord; choose the post's privacy and other options, then press **Post now** or **Schedule post**. Direct posts do not require the TikTok inbox step.
 
 Each Discord user connects their own TikTok account with `/link` for inbox uploads or `/link-post` for direct posts. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
 
@@ -29,7 +29,13 @@ Each Discord user connects their own TikTok account with `/link` for inbox uploa
    python -m ugc_bot.bot
    ```
 
-6. In Discord, run `/link`, authorize TikTok through the private link, then send a message that @mentions the bot and attaches a video. To post directly, run `/link-post` to grant `video.publish`, then send a video with exactly `post this` after the mention (for example, `@Bot post this`). The bot opens a panel for privacy, caption, interaction and commercial disclosure choices; pressing **Post to TikTok** sends it as a post. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
+6. In Discord, run `/link`, authorize TikTok through the private link, then send a message that @mentions the bot and attaches a video. To post directly, run `/link-post` to grant `video.publish`, then send a video with exactly `post this` after the mention (for example, `@Bot post this`). The bot opens a panel for privacy, caption, interaction and commercial disclosure choices. Press **Post now** to submit immediately, or **Schedule post** to choose a future time. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
+
+### Scheduled posts
+
+Choose **Schedule post** in the direct-post panel and enter a date, time, and explicit UTC offset such as `2026-10-12 14:30 -04:00`. The time must be at least one minute and no more than 30 days ahead. Discord displays the saved time in each viewer's local timezone. Run `/scheduled` to see your recent posts and their status; use `/cancel-post` with the displayed ID before a post starts. The bot sends a DM when TikTok confirms publication or reports a failure. If a transfer is interrupted, the post is marked **uncertain** and is not retried automatically, to avoid duplicates.
+
+Scheduling is handled by the bot: it saves the video alongside `bot.sqlite3` in a `scheduled_videos` directory, then calls TikTok's Direct Post API when the time arrives. Keep the bot running and the database and video directory on persistent storage. If the bot is offline at the chosen time, it submits pending posts after restarting. Up to 20 posts can be pending per Discord user. `/unlink` cancels pending posts and deletes their saved videos.
 
 `MAX_VIDEO_MB` defaults to 100 MB. The bot stores each upload temporarily and deletes it after transfer. Keep enough free disk space for two simultaneous videos.
 
@@ -39,7 +45,7 @@ Railpack reads [`railpack.json`](railpack.json) and starts the bot with `python 
 
 1. Connect this repository to a Railway service. In **Settings → Networking**, generate a public Railway domain. In **Settings → Deploy**, set the health check path to `/healthz` if you want Railway to verify startup.
 2. In the service's **Variables**, set `DISCORD_BOT_TOKEN`, `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY`. Set `TIKTOK_REDIRECT_URI` to `https://YOUR-RAILWAY-DOMAIN/oauth/callback`, using your actual generated domain. Register that exact URI in TikTok Login Kit. Add optional `DISCORD_GUILD_ID` and `MAX_VIDEO_MB` as needed. Railway does not use your local `.env` file.
-3. Attach a persistent volume to the service, for example at `/data`. The bot automatically puts `bot.sqlite3` there when Railway supplies `RAILWAY_VOLUME_MOUNT_PATH`. Keep the encryption key stable across deploys so stored TikTok connections remain readable.
+3. Attach a persistent volume to the service, for example at `/data`. The bot automatically puts `bot.sqlite3` and scheduled videos there when Railway supplies `RAILWAY_VOLUME_MOUNT_PATH`. Keep the encryption key stable across deploys so stored TikTok connections remain readable. Make sure the volume has space for every pending video.
 4. Redeploy from the updated repository. Once live, `https://YOUR-RAILWAY-DOMAIN/healthz` should return `ok`. Then run `/link` in Discord.
 
 Railway hosts both the Discord process and its HTTPS callback in this setup. You do not need the Cloudflare Tunnel below if you use the Railway domain. Keep the service to one replica while it uses SQLite and a single Discord bot connection.

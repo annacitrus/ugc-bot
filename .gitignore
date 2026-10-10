@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 *.sqlite3
 *.sqlite3-*
+scheduled_videos/
 .pytest_cache/
 cloudflare-tunnel.token
 /tools/cloudflared.exe

@@ -1,13 +1,15 @@
 import os
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from ugc_bot.bot import CaptionModal, DirectPostView, UploadBot, is_direct_post_request
+from ugc_bot.bot import CaptionModal, DirectPostView, UploadBot, is_direct_post_request, parse_schedule_time
 from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, TikTokError, authorization_url, chunk_ranges
@@ -83,6 +85,21 @@ class StorageTests(unittest.TestCase):
             self.assertIsNone(store.get_tokens(123))
             store.close()
 
+    def test_scheduled_post_claim_cancel_and_recovery(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = Storage(Path(directory) / "bot.sqlite3", Fernet.generate_key())
+            store.add_scheduled_post("one", 123, "one.mp4", "one.mp4", "video/mp4", {}, 100)
+            store.add_scheduled_post("two", 123, "two.mp4", "two.mp4", "video/mp4", {}, 200)
+            self.assertEqual(store.active_scheduled_count(123), 2)
+            self.assertEqual(store.cancel_scheduled_post(123, "two"), "two.mp4")
+            self.assertEqual(store.cancel_scheduled_post(456, "one"), None)
+            self.assertEqual(store.due_scheduled_posts(100)[0]["id"], "one")
+            self.assertTrue(store.claim_scheduled_post("one"))
+            self.assertFalse(store.claim_scheduled_post("one"))
+            self.assertEqual(store.recover_interrupted_posts(), [("one", 123, "one.mp4")])
+            self.assertEqual(store.list_scheduled_posts(123)[0]["state"], "uncertain")
+            store.close()
+
 
 class ConfigTests(unittest.TestCase):
     def test_railway_uses_public_listener_port_and_volume(self):
@@ -129,6 +146,15 @@ class BotStartupTests(unittest.TestCase):
 
 
 class TikTokValueTests(unittest.TestCase):
+    def test_schedule_time_requires_offset_and_future_window(self):
+        now = int(datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc).timestamp())
+        expected = int(datetime(2026, 10, 12, 18, 30, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(parse_schedule_time("2026-10-12 14:30 -04:00", now), expected)
+        with self.assertRaisesRegex(ValueError, "UTC offset"):
+            parse_schedule_time("2026-10-12 14:30", now)
+        with self.assertRaisesRegex(ValueError, "future"):
+            parse_schedule_time("2026-10-10 08:00 -04:00", now)
+
     def test_chunk_boundaries(self):
         self.assertEqual(chunk_ranges(4_000_000), [(0, 4_000_000)])
         self.assertEqual(chunk_ranges(64_000_000), [(0, 64_000_000)])
@@ -229,3 +255,83 @@ class TikTokUploadTests(unittest.TestCase):
         self.assertTrue(session.init_url.endswith("/v2/post/publish/video/init/"))
         self.assertEqual(session.init_payload["post_info"]["privacy_level"], "SELF_ONLY")
         self.assertEqual(session.uploads[0][1]["data"], b"test-video")
+
+
+class ScheduledPostingTests(unittest.TestCase):
+    def test_saved_video_posts_once_and_is_removed(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            config = Config(
+                discord_token="test", tiktok_client_key="test", tiktok_client_secret="test",
+                tiktok_redirect_uri="https://bot.example.com/oauth/callback",
+                encryption_key=Fernet.generate_key(), database_path=Path(directory) / "bot.sqlite3",
+                http_host="127.0.0.1", http_port=8080, discord_guild_id=None,
+                max_video_bytes=100_000_000,
+            )
+            bot = UploadBot(config)
+            bot.scheduled_dir.mkdir()
+            bot.storage.save_tokens(123, {
+                "access_token": "token", "expires_at": int(time.time()) + 3600,
+                "scope": "video.upload,video.publish",
+            })
+            calls = []
+            notices = []
+
+            class FakeTikTok:
+                async def creator_info(self, _):
+                    return {"privacy_level_options": ["SELF_ONLY"]}
+
+                async def post_video(self, _, path, mime_type, post_info):
+                    calls.append((path.read_bytes(), mime_type, post_info))
+                    return "publish-123"
+
+                async def status(self, _, publish_id):
+                    self_publish_id = publish_id
+                    return {"status": "PUBLISH_COMPLETE"} if self_publish_id == "publish-123" else {}
+
+            async def fake_download(_, path):
+                path.write_bytes(b"video-data")
+
+            async def fake_notify(user_id, message):
+                notices.append((user_id, message))
+
+            bot.tiktok = FakeTikTok()
+            bot._download = fake_download
+            bot._notify_scheduled = fake_notify
+            message = SimpleNamespace(
+                author=SimpleNamespace(id=123),
+                attachments=[SimpleNamespace(filename="video.mp4")],
+            )
+            settings = SimpleNamespace(
+                creator={"privacy_level_options": ["SELF_ONLY"]},
+                post_info=lambda _: {"privacy_level": "SELF_ONLY", "title": "Scheduled"},
+            )
+            scheduled_at = int(time.time()) + 120
+            try:
+                post_id = run_fake_coroutine(bot.schedule_direct_video(message, settings, scheduled_at))
+                self.assertTrue((bot.scheduled_dir / f"{post_id}.mp4").exists())
+                post = bot.storage.due_scheduled_posts(scheduled_at)[0]
+                run_fake_coroutine(bot._process_scheduled_post(post))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][0], b"video-data")
+                self.assertEqual(bot.storage.list_scheduled_posts(123)[0]["state"], "posted")
+                self.assertFalse((bot.scheduled_dir / f"{post_id}.mp4").exists())
+                self.assertEqual(len(notices), 1)
+                run_fake_coroutine(bot._process_scheduled_post(post))
+                self.assertEqual(len(calls), 1)
+
+                class UncertainTikTok(FakeTikTok):
+                    async def post_video(self, *_):
+                        raise TikTokError("transfer interrupted")
+
+                bot.tiktok = UncertainTikTok()
+                uncertain_id = run_fake_coroutine(bot.schedule_direct_video(message, settings, scheduled_at))
+                uncertain_post = bot.storage.due_scheduled_posts(scheduled_at)[0]
+                run_fake_coroutine(bot._process_scheduled_post(uncertain_post))
+                uncertain_row = next(
+                    row for row in bot.storage.list_scheduled_posts(123) if row["id"] == uncertain_id
+                )
+                self.assertEqual(uncertain_row["state"], "uncertain")
+                self.assertFalse((bot.scheduled_dir / f"{uncertain_id}.mp4").exists())
+                self.assertEqual(bot.storage.due_scheduled_posts(scheduled_at), [])
+            finally:
+                bot.storage.close()

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import re
+import secrets
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -24,6 +28,20 @@ def is_direct_post_request(content: str, bot_id: int) -> bool:
     return re.sub(rf"<@!?{bot_id}>", "", content).strip() == "post this"
 
 
+def parse_schedule_time(value: str, now: int | None = None) -> int:
+    try:
+        when = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M %z")
+    except ValueError as exc:
+        raise ValueError("Include a UTC offset: YYYY-MM-DD HH:MM -04:00, for example 2026-10-12 14:30 -04:00.") from exc
+    scheduled_at = int(when.astimezone(timezone.utc).timestamp())
+    current = int(time.time()) if now is None else now
+    if scheduled_at < current + 60:
+        raise ValueError("Choose a time at least one minute in the future.")
+    if scheduled_at > current + int(timedelta(days=30).total_seconds()):
+        raise ValueError("Choose a time within the next 30 days.")
+    return scheduled_at
+
+
 class CaptionModal(discord.ui.Modal, title="TikTok caption"):
     caption = discord.ui.TextInput(
         label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=2000
@@ -37,6 +55,50 @@ class CaptionModal(discord.ui.Modal, title="TikTok caption"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         self.post_view.caption = str(self.caption.value)
         await interaction.response.send_message("Caption saved for this post.", ephemeral=True)
+
+
+class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
+    when = discord.ui.TextInput(
+        label="Date and time with UTC offset",
+        placeholder="2026-10-12 14:30 -04:00",
+        max_length=26,
+    )
+
+    def __init__(self, post_view: DirectPostView, panel_message: discord.Message):
+        super().__init__()
+        self.post_view = post_view
+        self.panel_message = panel_message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            scheduled_at = parse_schedule_time(str(self.when.value))
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        if self.post_view.submitted:
+            await interaction.response.send_message("This post is already being sent or scheduled.", ephemeral=True)
+            return
+        error = self.post_view.selection_error()
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        self.post_view.submitted = True
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            post_id = await self.post_view.bot.schedule_direct_video(self.post_view.message, self.post_view, scheduled_at)
+        except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            self.post_view.submitted = False
+            await interaction.followup.send(f"Could not schedule this video: {exc}", ephemeral=True)
+            return
+        self.post_view.stop()
+        for item in self.post_view.children:
+            item.disabled = True
+        await self.panel_message.edit(
+            content=f"Scheduled **{self.post_view.message.attachments[0].filename}** for <t:{scheduled_at}:F> "
+                    f"(ID `{post_id}`). Use `/scheduled` to review or `/cancel-post` to cancel.",
+            view=self.post_view,
+        )
+        await interaction.followup.send(f"Scheduled for <t:{scheduled_at}:F>.", ephemeral=True)
 
 
 class DirectPostView(discord.ui.View):
@@ -114,28 +176,42 @@ class DirectPostView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.message.author.id:
-            await interaction.response.send_message("Only the person who attached the video can publish it.", ephemeral=True)
+            await interaction.response.send_message("Only the person who attached the video can post or schedule it.", ephemeral=True)
             return False
         return True
+
+    def selection_error(self) -> str | None:
+        if self.privacy is None:
+            return "Choose a privacy setting before posting."
+        if self.commercial in {"branded", "both"} and self.privacy not in {
+            "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS"
+        }:
+            return "Branded content needs Everyone or Friends visibility. Choose a different audience."
+        return None
+
+    def post_info(self, creator: dict) -> dict:
+        return {
+            "privacy_level": self.privacy,
+            "title": self.caption,
+            "disable_comment": "comment" not in self.interactions or creator.get("comment_disabled", False),
+            "disable_duet": "duet" not in self.interactions or creator.get("duet_disabled", False),
+            "disable_stitch": "stitch" not in self.interactions or creator.get("stitch_disabled", False),
+            "brand_organic_toggle": self.commercial in {"own", "both"},
+            "brand_content_toggle": self.commercial in {"branded", "both"},
+        }
 
     @discord.ui.button(label="Edit caption", style=discord.ButtonStyle.secondary, row=3)
     async def edit_caption(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CaptionModal(self))
 
-    @discord.ui.button(label="Post to TikTok", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="Post now", style=discord.ButtonStyle.primary, row=3)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if self.submitted:
             await interaction.response.send_message("This post is already being sent.", ephemeral=True)
             return
-        if self.privacy is None:
-            await interaction.response.send_message("Choose a privacy setting before posting.", ephemeral=True)
-            return
-        if self.commercial in {"branded", "both"} and self.privacy not in {
-            "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS"
-        }:
-            await interaction.response.send_message(
-                "Branded content needs Everyone or Friends visibility. Choose a different audience.", ephemeral=True
-            )
+        error = self.selection_error()
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         self.submitted = True
         self.stop()
@@ -143,6 +219,17 @@ class DirectPostView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content="Sending your video to TikTok…", view=self)
         await self.bot.post_direct_video(interaction.message, self.message, self)
+
+    @discord.ui.button(label="Schedule post", style=discord.ButtonStyle.secondary, row=3)
+    async def schedule(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.submitted:
+            await interaction.response.send_message("This post is already being sent or scheduled.", ephemeral=True)
+            return
+        error = self.selection_error()
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        await interaction.response.send_modal(ScheduleModal(self, interaction.message))
 
 
 class UploadBot(discord.Client):
@@ -153,6 +240,8 @@ class UploadBot(discord.Client):
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.storage = Storage(config.database_path, config.encryption_key)
+        self.scheduled_dir = config.database_path.parent / "scheduled_videos"
+        self.scheduled_task: asyncio.Task | None = None
         self.tiktok_session: aiohttp.ClientSession | None = None
         self.tiktok: TikTokAPI | None = None
         self.web_runner: web.AppRunner | None = None
@@ -185,8 +274,14 @@ class UploadBot(discord.Client):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        self.scheduled_dir.mkdir(parents=True, exist_ok=True)
+        self.scheduled_task = asyncio.create_task(self._scheduled_loop())
 
     async def close(self) -> None:
+        if self.scheduled_task:
+            self.scheduled_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.scheduled_task
         if self.web_runner:
             await self.web_runner.cleanup()
         if self.tiktok_session:
@@ -237,7 +332,45 @@ class UploadBot(discord.Client):
                         "you can remove this app in TikTok's account permissions."
                     )
                 self.storage.delete_tokens(interaction.user.id)
+                cancelled = self.storage.cancel_all_scheduled_posts(interaction.user.id)
+                for video_name in cancelled:
+                    (self.scheduled_dir / video_name).unlink(missing_ok=True)
+                if cancelled:
+                    result += f" Cancelled {len(cancelled)} pending scheduled post(s)."
             await interaction.followup.send(result, ephemeral=True)
+
+        @self.tree.command(name="scheduled", description="See your recent scheduled TikTok posts")
+        async def scheduled(interaction: discord.Interaction) -> None:
+            posts = self.storage.list_scheduled_posts(interaction.user.id)
+            if not posts:
+                await interaction.response.send_message("You have no scheduled posts.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            lines = [
+                f"`{post['id']}` · <t:{post['scheduled_at']}:F> · {post['state']} · "
+                f"{discord.utils.escape_markdown(discord.utils.escape_mentions(post['original_name']))[:50]}"
+                + (f" · {discord.utils.escape_mentions(post['error'])[:80]}" if post["error"] else "")
+                for post in posts
+            ]
+            for index in range(0, len(lines), 10):
+                await interaction.followup.send(
+                    ("Your scheduled posts:\n" if index == 0 else "More scheduled posts:\n")
+                    + "\n".join(lines[index:index + 10])
+                    + ("\nUse `/cancel-post` for a pending post." if index + 10 >= len(lines) else ""),
+                    ephemeral=True,
+                )
+
+        @self.tree.command(name="cancel-post", description="Cancel a pending scheduled TikTok post")
+        @app_commands.describe(post_id="ID shown by /scheduled")
+        async def cancel_post(interaction: discord.Interaction, post_id: str) -> None:
+            async with self._lock(interaction.user.id):
+                video_name = self.storage.cancel_scheduled_post(interaction.user.id, post_id.strip())
+                if video_name:
+                    (self.scheduled_dir / video_name).unlink(missing_ok=True)
+            await interaction.response.send_message(
+                "Scheduled post cancelled." if video_name else "No pending post with that ID was found.",
+                ephemeral=True,
+            )
 
     async def oauth_callback(self, request: web.Request) -> web.Response:
         state = request.query.get("state", "")
@@ -313,7 +446,7 @@ class UploadBot(discord.Client):
             account = creator.get("creator_nickname") or creator.get("creator_username") or "your TikTok account"
             await message.reply(
                 f"Post **{attachment.filename}** to **{account}**. Choose privacy, review the options, "
-                "then press **Post to TikTok**. By posting, you agree to TikTok's "
+                "then choose **Post now** or **Schedule post**. By posting, you agree to TikTok's "
                 "[Music Usage Confirmation](https://www.tiktok.com/legal/page/global/music-usage-confirmation/en). "
                 "For branded content, you also agree to TikTok's "
                 "[Branded Content Policy](https://www.tiktok.com/legal/page/global/bc-policy/en). "
@@ -381,15 +514,7 @@ class UploadBot(discord.Client):
                     "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS"
                 }:
                     raise TikTokError("Branded content needs Everyone or Friends visibility.")
-                post_info = {
-                    "privacy_level": settings.privacy,
-                    "title": settings.caption,
-                    "disable_comment": "comment" not in settings.interactions or creator.get("comment_disabled", False),
-                    "disable_duet": "duet" not in settings.interactions or creator.get("duet_disabled", False),
-                    "disable_stitch": "stitch" not in settings.interactions or creator.get("stitch_disabled", False),
-                    "brand_organic_toggle": settings.commercial in {"own", "both"},
-                    "brand_content_toggle": settings.commercial in {"branded", "both"},
-                }
+                post_info = settings.post_info(creator)
                 with tempfile.TemporaryDirectory(prefix="ugc-bot-") as directory:
                     path = Path(directory) / ("video" + suffix)
                     await self._download(attachment, path)
@@ -419,6 +544,140 @@ class UploadBot(discord.Client):
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                 log.exception("TikTok direct post failed for Discord user %s", message.author.id)
                 await progress.edit(content="Direct post failed due to a network or file error. Please try again.")
+
+    async def schedule_direct_video(
+        self, message: discord.Message, settings: DirectPostView, scheduled_at: int
+    ) -> str:
+        attachment = message.attachments[0]
+        suffix = Path(attachment.filename).suffix.lower()
+        post_id = secrets.token_hex(6)
+        video_name = post_id + suffix
+        path = self.scheduled_dir / video_name
+        partial_path = self.scheduled_dir / (video_name + ".part")
+        async with self.upload_slots, self._lock(message.author.id):
+            tokens = self.storage.get_tokens(message.author.id)
+            if not tokens or "video.publish" not in {
+                scope.strip() for scope in tokens.get("scope", "").split(",")
+            }:
+                raise TikTokError("Direct posting is not connected. Run /link-post again.")
+            if self.storage.active_scheduled_count(message.author.id) >= 20:
+                raise TikTokError("You already have 20 pending scheduled posts. Cancel one before adding another.")
+            self.scheduled_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                await self._download(attachment, partial_path)
+                partial_path.replace(path)
+                self.storage.add_scheduled_post(
+                    post_id, message.author.id, video_name, attachment.filename,
+                    MIME_TYPES[suffix], settings.post_info(settings.creator), scheduled_at,
+                )
+            except BaseException:
+                partial_path.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                raise
+        return post_id
+
+    async def _notify_scheduled(self, user_id: int, message: str) -> None:
+        try:
+            user = self.get_user(user_id) or await self.fetch_user(user_id)
+            await user.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.warning("Could not notify Discord user %s about a scheduled post", user_id)
+
+    async def _check_scheduled_post(self, post: dict, token: str | None = None) -> None:
+        user_id = int(post["discord_user_id"])
+        try:
+            if token is None:
+                token = await self._access_token(user_id)
+            assert self.tiktok is not None
+            status = await self.tiktok.status(token, post["publish_id"])
+        except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError):
+            log.warning("Could not check scheduled TikTok post %s", post["id"])
+            return
+        state = status.get("status")
+        if state == "PUBLISH_COMPLETE":
+            self.storage.update_scheduled_post(post["id"], "posted")
+            await self._notify_scheduled(user_id, f"Scheduled TikTok post `{post['id']}` was published.")
+        elif state == "FAILED":
+            reason = str(status.get("fail_reason", "unknown"))[:200]
+            self.storage.update_scheduled_post(post["id"], "failed", error=reason)
+            await self._notify_scheduled(user_id, f"Scheduled TikTok post `{post['id']}` failed: {reason}")
+
+    async def _process_scheduled_post(self, post: dict) -> None:
+        user_id = int(post["discord_user_id"])
+        async with self._lock(user_id):
+            if post["state"] == "submitted":
+                await self._check_scheduled_post(post)
+                return
+            if not self.storage.claim_scheduled_post(post["id"]):
+                return
+            path = self.scheduled_dir / post["video_name"]
+            try:
+                if not path.is_file():
+                    raise TikTokError("Saved video is missing from the bot's storage.")
+                tokens = self.storage.get_tokens(user_id)
+                if not tokens or "video.publish" not in {
+                    scope.strip() for scope in tokens.get("scope", "").split(",")
+                }:
+                    raise TikTokError("TikTok direct-post permission is no longer connected.")
+                token = await self._access_token(user_id)
+                assert self.tiktok is not None
+                creator = await self.tiktok.creator_info(token)
+                post_info = json.loads(post["post_info"])
+                if post_info["privacy_level"] not in creator.get("privacy_level_options", []):
+                    raise TikTokError("The selected TikTok privacy setting is no longer available.")
+                for name in ("comment", "duet", "stitch"):
+                    if creator.get(f"{name}_disabled", False):
+                        post_info[f"disable_{name}"] = True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                self.storage.update_scheduled_post(post["id"], "pending", error="Temporary network error; will retry.")
+                log.warning("Scheduled TikTok post %s will retry after network error: %s", post["id"], exc)
+                return
+            except (TikTokError, OSError, ValueError, KeyError) as exc:
+                reason = str(exc)[:200]
+                self.storage.update_scheduled_post(post["id"], "failed", error=reason)
+                path.unlink(missing_ok=True)
+                await self._notify_scheduled(user_id, f"Scheduled TikTok post `{post['id']}` failed: {reason}")
+                return
+            try:
+                async with self.upload_slots:
+                    publish_id = await self.tiktok.post_video(token, path, post["mime_type"], post_info)
+            except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                self.storage.update_scheduled_post(
+                    post["id"], "uncertain",
+                    error="Could not confirm whether TikTok received this post; check your profile before retrying.",
+                )
+                path.unlink(missing_ok=True)
+                log.warning("Scheduled TikTok post %s could not be confirmed: %s", post["id"], exc)
+                await self._notify_scheduled(
+                    user_id, f"Scheduled TikTok post `{post['id']}` may have been sent. "
+                             "Check your profile before trying again; the bot will not retry it automatically."
+                )
+                return
+            self.storage.update_scheduled_post(post["id"], "submitted", publish_id=publish_id)
+            path.unlink(missing_ok=True)
+            post["publish_id"] = publish_id
+            await self._check_scheduled_post(post, token)
+
+    async def _scheduled_loop(self) -> None:
+        await self.wait_until_ready()
+        interrupted = self.storage.recover_interrupted_posts()
+        for post_id, user_id, video_name in interrupted:
+            (self.scheduled_dir / video_name).unlink(missing_ok=True)
+            await self._notify_scheduled(
+                user_id, f"Scheduled TikTok post `{post_id}` was interrupted. Check your profile before trying again."
+            )
+        while True:
+            try:
+                posts = self.storage.due_scheduled_posts(int(time.time()))
+                results = await asyncio.gather(
+                    *(self._process_scheduled_post(post) for post in posts), return_exceptions=True
+                )
+                for result in results:
+                    if isinstance(result, Exception):
+                        log.error("Scheduled post worker error: %r", result)
+            except Exception:
+                log.exception("Scheduled post worker failed")
+            await asyncio.sleep(30)
 
     async def _download(self, attachment: discord.Attachment, path: Path) -> None:
         assert self.tiktok_session is not None
