@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from ugc_bot.bot import CaptionModal, DirectPostView, UploadBot, is_direct_post_request, parse_schedule_time
+from ugc_bot.bot import CaptionModal, DirectPostView, ScheduleModal, UploadBot, is_direct_post_request, parse_schedule_time
 from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, TikTokError, authorization_url, chunk_ranges
@@ -70,6 +70,21 @@ def run_fake_coroutine(coroutine):
 
 
 class StorageTests(unittest.TestCase):
+    def test_time_zone_is_saved_per_user(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            database = Path(directory) / "bot.sqlite3"
+            key = Fernet.generate_key()
+            store = Storage(database, key)
+            self.assertIsNone(store.get_time_zone(123))
+            store.set_time_zone(123, "America/Indianapolis")
+            store.set_time_zone(456, "UTC")
+            store.set_time_zone(123, "America/Chicago")
+            store.close()
+            store = Storage(database, key)
+            self.assertEqual(store.get_time_zone(123), "America/Chicago")
+            self.assertEqual(store.get_time_zone(456), "UTC")
+            store.close()
+
     def test_state_is_one_use_and_tokens_are_encrypted(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             database = Path(directory) / "bot.sqlite3"
@@ -146,6 +161,21 @@ class BotStartupTests(unittest.TestCase):
 
 
 class TikTokValueTests(unittest.TestCase):
+    def test_schedule_time_uses_saved_zone_and_handles_clock_changes(self):
+        now = int(datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp())
+        expected = int(datetime(2026, 10, 12, 18, 30, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(parse_schedule_time("2026-10-12 14:30", now, "America/Indianapolis"), expected)
+        with self.assertRaisesRegex(ValueError, "occurs twice"):
+            parse_schedule_time("2026-11-01 01:30", now, "America/Indianapolis")
+        earlier = parse_schedule_time("2026-11-01 01:30 -04:00", now, "America/Indianapolis")
+        later = parse_schedule_time("2026-11-01 01:30 -05:00", now, "America/Indianapolis")
+        self.assertEqual(later - earlier, 3600)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            parse_schedule_time("2026-10-12 14:30 -05:00", now, "America/Indianapolis")
+        spring_now = int(datetime(2026, 3, 1, tzinfo=timezone.utc).timestamp())
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            parse_schedule_time("2026-03-08 02:30", spring_now, "America/Indianapolis")
+
     def test_schedule_time_requires_offset_and_future_window(self):
         now = int(datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc).timestamp())
         expected = int(datetime(2026, 10, 12, 18, 30, tzinfo=timezone.utc).timestamp())
@@ -190,6 +220,8 @@ class TikTokValueTests(unittest.TestCase):
         self.assertFalse(view.submitted)
         self.assertEqual(view.commercial, "none")
         self.assertEqual(CaptionModal(view).caption.default, "")
+        modal = ScheduleModal(view, SimpleNamespace(), "America/Indianapolis")
+        self.assertIn("America/Indianapolis", modal.when.to_component_dict()["label"])
 
 
 class TikTokUploadTests(unittest.TestCase):

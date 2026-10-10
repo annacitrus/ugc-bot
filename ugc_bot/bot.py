@@ -10,6 +10,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
@@ -28,12 +29,80 @@ def is_direct_post_request(content: str, bot_id: int) -> bool:
     return re.sub(rf"<@!?{bot_id}>", "", content).strip() == "post this"
 
 
-def parse_schedule_time(value: str, now: int | None = None) -> int:
+def load_time_zone(name: str) -> ZoneInfo:
+    if not name or len(name) > 64:
+        raise ValueError("Enter a valid IANA time zone, for example `America/Indianapolis`.")
     try:
-        when = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M %z")
-    except ValueError as exc:
-        raise ValueError("Include a UTC offset: YYYY-MM-DD HH:MM -04:00, for example 2026-10-12 14:30 -04:00.") from exc
-    scheduled_at = int(when.astimezone(timezone.utc).timestamp())
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Unknown time zone `{name}`. Use an IANA name such as `America/Indianapolis`; "
+            "install the bot's dependencies if that name should exist."
+        ) from exc
+
+
+def format_utc_offset(offset: timedelta) -> str:
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, remainder = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours:02d}:{remainder:02d}"
+
+
+def time_zone_display(name: str) -> str:
+    try:
+        local_now = datetime.now(load_time_zone(name))
+    except ValueError:
+        return name
+    return f"{name} (now {local_now:%H:%M}, {format_utc_offset(local_now.utcoffset())})"
+
+
+def parse_schedule_time(value: str, now: int | None = None, time_zone: str | None = None) -> int:
+    text = value.strip()
+    if time_zone is None:
+        try:
+            when = datetime.strptime(text, "%Y-%m-%d %H:%M %z")
+        except ValueError as exc:
+            raise ValueError(
+                "Include a UTC offset, for example `2026-10-12 14:30 -04:00`, "
+                "or set your time zone with `/set-time-zone`."
+            ) from exc
+        scheduled_at = int(when.timestamp())
+    else:
+        zone = load_time_zone(time_zone)
+        explicit_offset = None
+        try:
+            local = datetime.strptime(text, "%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                explicit_offset = datetime.strptime(text, "%Y-%m-%d %H:%M %z")
+                local = explicit_offset.replace(tzinfo=None)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Enter local time in `{time_zone}` as `YYYY-MM-DD HH:MM`, "
+                    "for example `2026-10-12 14:30`."
+                ) from exc
+        candidates: dict[int, timedelta] = {}
+        for fold in (0, 1):
+            candidate = local.replace(tzinfo=zone, fold=fold)
+            try:
+                timestamp = int(candidate.timestamp())
+                if datetime.fromtimestamp(timestamp, zone).replace(tzinfo=None) == local:
+                    candidates[timestamp] = candidate.utcoffset()
+            except (OverflowError, OSError, ValueError):
+                continue
+        if not candidates:
+            raise ValueError(f"That local time does not exist in `{time_zone}` because of a clock change.")
+        if explicit_offset is not None:
+            scheduled_at = int(explicit_offset.timestamp())
+            if scheduled_at not in candidates:
+                raise ValueError(f"That UTC offset does not match `{time_zone}` at the chosen time.")
+        elif len(candidates) > 1:
+            offsets = " or ".join(sorted(format_utc_offset(offset) for offset in candidates.values()))
+            raise ValueError(
+                f"That time occurs twice in `{time_zone}`. Add an offset ({offsets}) after the time."
+            )
+        else:
+            scheduled_at = next(iter(candidates))
     current = int(time.time()) if now is None else now
     if scheduled_at < current + 60:
         raise ValueError("Choose a time at least one minute in the future.")
@@ -58,20 +127,29 @@ class CaptionModal(discord.ui.Modal, title="TikTok caption"):
 
 
 class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
-    when = discord.ui.TextInput(
-        label="Date and time with UTC offset",
-        placeholder="2026-10-12 14:30 -04:00",
-        max_length=26,
-    )
-
-    def __init__(self, post_view: DirectPostView, panel_message: discord.Message):
+    def __init__(self, post_view: DirectPostView, panel_message: discord.Message, time_zone: str | None):
         super().__init__()
         self.post_view = post_view
         self.panel_message = panel_message
+        self.time_zone = time_zone
+        if time_zone:
+            label = f"Time in {time_zone}"
+            label = label if len(label) <= 45 else "Local date and time (zone below)"
+            placeholder = f"{time_zone}: YYYY-MM-DD HH:MM"
+        else:
+            label = "Date and time with UTC offset"
+            placeholder = "YYYY-MM-DD HH:MM -04:00"
+        self.when = discord.ui.TextInput(label=label, placeholder=placeholder, max_length=80)
+        self.add_item(self.when)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.post_view.bot.storage.get_time_zone(self.post_view.message.author.id) != self.time_zone:
+            await interaction.response.send_message(
+                "Your time zone changed. Open Schedule post again to review the time in the new zone.", ephemeral=True
+            )
+            return
         try:
-            scheduled_at = parse_schedule_time(str(self.when.value))
+            scheduled_at = parse_schedule_time(str(self.when.value), time_zone=self.time_zone)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
@@ -95,7 +173,8 @@ class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
             item.disabled = True
         await self.panel_message.edit(
             content=f"Scheduled **{self.post_view.message.attachments[0].filename}** for <t:{scheduled_at}:F> "
-                    f"(ID `{post_id}`). Use `/scheduled` to review or `/cancel-post` to cancel.",
+                    f"(ID `{post_id}`; entered in {self.time_zone or 'the supplied UTC offset'}). "
+                    "Use `/scheduled` to review or `/cancel-post` to cancel.",
             view=self.post_view,
         )
         await interaction.followup.send(f"Scheduled for <t:{scheduled_at}:F>.", ephemeral=True)
@@ -229,7 +308,8 @@ class DirectPostView(discord.ui.View):
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
-        await interaction.response.send_modal(ScheduleModal(self, interaction.message))
+        time_zone = self.bot.storage.get_time_zone(self.message.author.id)
+        await interaction.response.send_modal(ScheduleModal(self, interaction.message, time_zone))
 
 
 class UploadBot(discord.Client):
@@ -309,9 +389,35 @@ class UploadBot(discord.Client):
                 ("video.upload", "video.publish"),
             )
             await interaction.response.send_message(
-                "Authorize TikTok direct posting here (link expires in 10 minutes):\n" + url,
+                "Authorize TikTok direct posting here (link expires in 10 minutes):\n" + url
+                + "\nTo schedule in your local time, set it with `/set-time-zone` "
+                  "(for example `America/Indianapolis`).",
                 ephemeral=True,
             )
+
+        @self.tree.command(name="set-time-zone", description="Set or view your time zone for scheduled posts")
+        @app_commands.describe(time_zone="IANA name, for example America/Indianapolis; omit to view your setting")
+        async def set_time_zone(interaction: discord.Interaction, time_zone: str | None = None) -> None:
+            if time_zone is None:
+                saved = self.storage.get_time_zone(interaction.user.id)
+                result = (
+                    f"Your scheduling time zone is `{time_zone_display(saved)}`."
+                    if saved else "No scheduling time zone set. Use `/set-time-zone` with an IANA name "
+                            "such as `America/Indianapolis`."
+                )
+            else:
+                name = time_zone.strip()
+                try:
+                    load_time_zone(name)
+                except ValueError as exc:
+                    await interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                self.storage.set_time_zone(interaction.user.id, name)
+                result = (
+                    f"Scheduling time zone set to `{time_zone_display(name)}`. "
+                    "Existing scheduled posts keep their original publish times."
+                )
+            await interaction.response.send_message(result, ephemeral=True)
 
         @self.tree.command(name="unlink", description="Disconnect your TikTok account")
         async def unlink(interaction: discord.Interaction) -> None:
@@ -444,6 +550,13 @@ class UploadBot(discord.Client):
                 await message.reply(f"Could not prepare a direct post: {exc}", mention_author=False)
                 return
             account = creator.get("creator_nickname") or creator.get("creator_username") or "your TikTok account"
+            saved_zone = self.storage.get_time_zone(message.author.id)
+            schedule_hint = (
+                f"Scheduling time zone: `{time_zone_display(saved_zone)}`. "
+                "Use `/set-time-zone` if it is wrong."
+                if saved_zone else
+                "Scheduling time zone: not set. Enter a UTC offset or use `/set-time-zone` first."
+            )
             await message.reply(
                 f"Post **{attachment.filename}** to **{account}**. Choose privacy, review the options, "
                 "then choose **Post now** or **Schedule post**. By posting, you agree to TikTok's "
@@ -451,7 +564,7 @@ class UploadBot(discord.Client):
                 "For branded content, you also agree to TikTok's "
                 "[Branded Content Policy](https://www.tiktok.com/legal/page/global/bc-policy/en). "
                 "Unaudited apps can only post privately to private TikTok accounts. "
-                "The video may take a few minutes to appear on your profile.",
+                "The video may take a few minutes to appear on your profile.\n" + schedule_hint,
                 mention_author=False,
                 view=view,
             )

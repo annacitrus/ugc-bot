@@ -2,3 +2,4 @@ aiohttp>=3.10,<4
 cryptography>=43
 discord.py>=2.4,<3
 python-dotenv>=1,<2
+tzdata>=2025.2

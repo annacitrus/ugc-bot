@@ -25,6 +25,10 @@ class Storage:
                 discord_user_id TEXT PRIMARY KEY,
                 encrypted_tokens BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_settings (
+                discord_user_id TEXT PRIMARY KEY,
+                time_zone TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id TEXT PRIMARY KEY,
                 discord_user_id TEXT NOT NULL,
@@ -81,6 +85,21 @@ class Storage:
     def delete_tokens(self, discord_user_id: int) -> None:
         with self.db:
             self.db.execute("DELETE FROM accounts WHERE discord_user_id = ?", (str(discord_user_id),))
+
+    def set_time_zone(self, discord_user_id: int, time_zone: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO user_settings (discord_user_id, time_zone) VALUES (?, ?) "
+                "ON CONFLICT(discord_user_id) DO UPDATE SET time_zone = excluded.time_zone",
+                (str(discord_user_id), time_zone),
+            )
+
+    def get_time_zone(self, discord_user_id: int) -> str | None:
+        row = self.db.execute(
+            "SELECT time_zone FROM user_settings WHERE discord_user_id = ?",
+            (str(discord_user_id),),
+        ).fetchone()
+        return row[0] if row else None
 
     def add_scheduled_post(
         self, post_id: str, discord_user_id: int, video_name: str,
