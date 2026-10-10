@@ -2,7 +2,7 @@
 
 Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. A normal message sends the file to your TikTok inbox, where you finish editing and publishing. Without an attachment, the bot replies with an upload instruction. Send `@Bot post this` with one video to open a direct-post panel in Discord; choose the post's privacy and other options, then press **Post now** or **Schedule post**. Direct posts do not require the TikTok inbox step.
 
-Each Discord user connects their own TikTok account with `/link` for inbox uploads or `/link-post` for direct posts. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
+Each Discord user connects their own TikTok account with `/link-tiktok` for inbox uploads and direct posts. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
 
 ## Set up
 
@@ -29,7 +29,7 @@ Each Discord user connects their own TikTok account with `/link` for inbox uploa
    python -m ugc_bot.bot
    ```
 
-6. In Discord, run `/link`, authorize TikTok through the private link, then send a message that @mentions the bot and attaches a video. To post directly, run `/link-post` to grant `video.publish`. For scheduling, run `/set-time-zone` with your IANA time zone, for example `America/Indianapolis`. Then send a video with exactly `post this` after the mention (for example, `@Bot post this`). The bot opens a panel for privacy, caption, interaction and commercial disclosure choices. Press **Post now** to submit immediately, or **Schedule post** to choose a future time. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
+6. In Discord, run `/link-tiktok` and authorize both `video.upload` and `video.publish` through the private link. Then send a message that @mentions the bot and attaches a video for an inbox upload. For scheduling, run `/set-time-zone` with your IANA time zone, for example `America/Indianapolis`. To post directly, send a video with exactly `post this` after the mention (for example, `@Bot post this`). The bot opens a panel for privacy, caption, interaction and commercial disclosure choices. Press **Post now** to submit immediately, or **Schedule post** to choose a future time. Use `/unlink` to disconnect. Set `DISCORD_GUILD_ID` during development for immediate command registration in one server; global slash commands can take time to appear.
 
 ### Scheduled posts
 
@@ -48,7 +48,7 @@ Railpack reads [`railpack.json`](railpack.json) and starts the bot with `python 
 1. Connect this repository to a Railway service. In **Settings → Networking**, generate a public Railway domain. In **Settings → Deploy**, set the health check path to `/healthz` if you want Railway to verify startup.
 2. In the service's **Variables**, set `DISCORD_BOT_TOKEN`, `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY`. Set `TIKTOK_REDIRECT_URI` to `https://YOUR-RAILWAY-DOMAIN/oauth/callback`, using your actual generated domain. Register that exact URI in TikTok Login Kit. Add optional `DISCORD_GUILD_ID` and `MAX_VIDEO_MB` as needed. Railway does not use your local `.env` file.
 3. Attach a persistent volume to the service, for example at `/data`. The bot automatically puts `bot.sqlite3` and scheduled videos there when Railway supplies `RAILWAY_VOLUME_MOUNT_PATH`. Keep the encryption key stable across deploys so stored TikTok connections remain readable. Make sure the volume has space for every pending video.
-4. Redeploy from the updated repository. Once live, `https://YOUR-RAILWAY-DOMAIN/healthz` should return `ok`. Then run `/link` in Discord.
+4. Redeploy from the updated repository. Once live, `https://YOUR-RAILWAY-DOMAIN/healthz` should return `ok`. Then run `/link-tiktok` in Discord.
 
 Railway hosts both the Discord process and its HTTPS callback in this setup. You do not need the Cloudflare Tunnel below if you use the Railway domain. Keep the service to one replica while it uses SQLite and a single Discord bot connection.
 
@@ -83,12 +83,12 @@ You need a Cloudflare account with a domain added to it. Pick a dedicated hostna
    .\scripts\check-cloudflare.ps1
    ```
 
-Both checks should print `OK`. The callback path itself returns an error without a valid one-time OAuth state; that is expected. Run `/link` in Discord for the real flow.
+Both checks should print `OK`. The callback path itself returns an error without a valid one-time OAuth state; that is expected. Run `/link-tiktok` in Discord for the real flow.
 
 Cloudflare's [tunnel setup](https://developers.cloudflare.com/tunnel/get-started/) and [token-file option](https://developers.cloudflare.com/tunnel/reference/run-parameters/) describe the dashboard and connector steps. TikTok requires the [registered HTTPS redirect URI](https://developers.tiktok.com/docs/en/login-kit-web) to match the OAuth request.
 
 ## TikTok limits
 
-TikTok's Upload API sends videos to the creator's inbox for completion in the TikTok app. TikTok limits pending shares (currently up to five in a 24-hour period) and video length (up to ten minutes for this API). The app requires a TikTok developer configuration and permission for `video.upload`; TikTok may reject a developer app or restrict access based on its product guidelines. Direct posting uses the separate `video.publish` scope, requires each user to reauthorize with `/link-post`, and follows TikTok's per-post privacy and consent requirements. **Unaudited apps can only post privately (`SELF_ONLY`) and only to private creator accounts**; public posting requires TikTok audit approval. The Direct Post API also has daily posting caps.
+TikTok's Upload API sends videos to the creator's inbox for completion in the TikTok app. TikTok limits pending shares (currently up to five in a 24-hour period) and video length (up to ten minutes for this API). The app requires a TikTok developer configuration and permission for `video.upload`; TikTok may reject a developer app or restrict access based on its product guidelines. Direct posting uses the separate `video.publish` scope and follows TikTok's per-post privacy and consent requirements. Existing upload-only connections must reauthorize with `/link-tiktok` to post directly. **Unaudited apps can only post privately (`SELF_ONLY`) and only to private creator accounts**; public posting requires TikTok audit approval. The Direct Post API also has daily posting caps.
 
 Official references: [Upload API](https://developers.tiktok.com/docs/en/content-posting-api-reference-upload-video), [Direct Post API](https://developers.tiktok.com/docs/en/content-posting-api-reference-direct-post), [content sharing guidelines](https://developers.tiktok.com/docs/en/content-sharing-guidelines), [media transfer rules](https://developers.tiktok.com/docs/en/content-posting-api-media-transfer-guide), [Login Kit](https://developers.tiktok.com/docs/en/login-kit-web), [token management](https://developers.tiktok.com/docs/en/oauth-user-access-token-management), [Discord mention access](https://support-dev.discord.com/hc/en-us/articles/6383579033751-Message-Content-Intent-Alternatives-Workarounds).

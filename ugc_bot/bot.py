@@ -370,26 +370,13 @@ class UploadBot(discord.Client):
         await super().close()
 
     def _register_commands(self) -> None:
-        @self.tree.command(name="link", description="Connect your TikTok account for video uploads")
-        async def link(interaction: discord.Interaction) -> None:
+        @self.tree.command(name="link-tiktok", description="Connect TikTok for inbox uploads and direct posts")
+        async def link_tiktok(interaction: discord.Interaction) -> None:
             state = self.storage.new_state(interaction.user.id)
             url = authorization_url(self.config.tiktok_client_key, self.config.tiktok_redirect_uri, state)
             await interaction.response.send_message(
-                "Connect your TikTok account here (link expires in 10 minutes):\n" + url,
-                ephemeral=True,
-            )
-
-        @self.tree.command(name="link-post", description="Allow direct posts to your TikTok account")
-        async def link_post(interaction: discord.Interaction) -> None:
-            state = self.storage.new_state(interaction.user.id)
-            url = authorization_url(
-                self.config.tiktok_client_key,
-                self.config.tiktok_redirect_uri,
-                state,
-                ("video.upload", "video.publish"),
-            )
-            await interaction.response.send_message(
-                "Authorize TikTok direct posting here (link expires in 10 minutes):\n" + url
+                "Connect your TikTok account for uploads and direct posts "
+                "(link expires in 10 minutes):\n" + url
                 + "\nTo schedule in your local time, set it with `/set-time-zone` "
                   "(for example `America/Indianapolis`).",
                 ephemeral=True,
@@ -482,9 +469,9 @@ class UploadBot(discord.Client):
         state = request.query.get("state", "")
         user_id = self.storage.consume_state(state) if state else None
         if user_id is None:
-            return web.Response(status=400, text="Invalid or expired link. Return to Discord and run /link again.")
+            return web.Response(status=400, text="Invalid or expired link. Return to Discord and run /link-tiktok again.")
         if request.query.get("error"):
-            return web.Response(status=400, text="TikTok authorization was declined. Return to Discord and run /link again.")
+            return web.Response(status=400, text="TikTok authorization was declined. Return to Discord and run /link-tiktok again.")
         code = request.query.get("code")
         if not code:
             return web.Response(status=400, text="TikTok did not provide an authorization code.")
@@ -493,15 +480,18 @@ class UploadBot(discord.Client):
             tokens = await self.tiktok.exchange_code(code)
             async with self._lock(user_id):
                 self.storage.save_tokens(user_id, tokens)
-        except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError):
+        except TikTokError as exc:
+            log.warning("TikTok OAuth exchange failed for Discord user %s: %s", user_id, exc)
+            return web.Response(status=400, text=f"{exc}. Return to Discord and run /link-tiktok again.")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             log.warning("TikTok OAuth exchange failed for Discord user %s", user_id)
-            return web.Response(status=502, text="TikTok connection failed. Return to Discord and run /link again.")
+            return web.Response(status=502, text="TikTok connection failed. Return to Discord and run /link-tiktok again.")
         return web.Response(text="TikTok connected. Return to Discord and @mention the bot with one video file.")
 
     async def _access_token(self, user_id: int) -> str:
         tokens = self.storage.get_tokens(user_id)
         if not tokens:
-            raise TikTokError("No TikTok account connected. Run /link first.")
+            raise TikTokError("No TikTok account connected. Run /link-tiktok first.")
         if int(tokens["expires_at"]) <= int(time.time()) + 60:
             assert self.tiktok is not None
             tokens = await self.tiktok.refresh(tokens["refresh_token"])
@@ -530,14 +520,14 @@ class UploadBot(discord.Client):
             await message.reply(f"Video must be between 1 byte and {limit} MB.", mention_author=False)
             return
         if not self.storage.get_tokens(message.author.id):
-            await message.reply("Run `/link` to connect your TikTok account first.", mention_author=False)
+            await message.reply("Run `/link-tiktok` to connect your TikTok account first.", mention_author=False)
             return
 
         if is_direct_post_request(message.content, self.user.id):
             tokens = self.storage.get_tokens(message.author.id)
             if "video.publish" not in {scope.strip() for scope in tokens.get("scope", "").split(",")}:
                 await message.reply(
-                    "Direct posting needs TikTok's `video.publish` permission. Run `/link-post` first.",
+                    "Direct posting needs TikTok's `video.publish` permission. Run `/link-tiktok` again.",
                     mention_author=False,
                 )
                 return
@@ -672,7 +662,7 @@ class UploadBot(discord.Client):
             if not tokens or "video.publish" not in {
                 scope.strip() for scope in tokens.get("scope", "").split(",")
             }:
-                raise TikTokError("Direct posting is not connected. Run /link-post again.")
+                raise TikTokError("Direct posting is not connected. Run /link-tiktok again.")
             if self.storage.active_scheduled_count(message.author.id) >= 20:
                 raise TikTokError("You already have 20 pending scheduled posts. Cancel one before adding another.")
             self.scheduled_dir.mkdir(parents=True, exist_ok=True)

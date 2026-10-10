@@ -20,13 +20,11 @@ class TikTokError(Exception):
     pass
 
 
-def authorization_url(
-    client_key: str, redirect_uri: str, state: str, scopes: tuple[str, ...] = ("video.upload",)
-) -> str:
+def authorization_url(client_key: str, redirect_uri: str, state: str) -> str:
     return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(
         {
             "client_key": client_key,
-            "scope": ",".join(scopes),
+            "scope": "video.upload,video.publish",
             "response_type": "code",
             "redirect_uri": redirect_uri,
             "state": state,
@@ -55,7 +53,9 @@ class TikTokAPI:
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
 
-    async def _token_request(self, data: dict[str, str]) -> dict:
+    async def _token_request(
+        self, data: dict[str, str], required_scopes: tuple[str, ...] = ("video.upload",)
+    ) -> dict:
         async with self.session.post(
             f"{API}/v2/oauth/token/",
             data={"client_key": self.client_key, "client_secret": self.client_secret, **data},
@@ -64,14 +64,17 @@ class TikTokAPI:
         if response.status != 200 or "error" in body:
             code = body.get("error", "token_request_failed")
             raise TikTokError(f"TikTok authorization failed: {code}")
-        if "video.upload" not in {scope.strip() for scope in body.get("scope", "").split(",")}:
-            raise TikTokError("TikTok did not grant video.upload permission")
+        granted_scopes = {scope.strip() for scope in body.get("scope", "").split(",")}
+        missing_scopes = set(required_scopes) - granted_scopes
+        if missing_scopes:
+            raise TikTokError(f"TikTok did not grant {', '.join(sorted(missing_scopes))} permission")
         body["expires_at"] = int(time.time()) + int(body["expires_in"])
         return body
 
     async def exchange_code(self, code: str) -> dict:
         return await self._token_request(
-            {"code": code, "grant_type": "authorization_code", "redirect_uri": self.redirect_uri}
+            {"code": code, "grant_type": "authorization_code", "redirect_uri": self.redirect_uri},
+            ("video.upload", "video.publish"),
         )
 
     async def refresh(self, refresh_token: str) -> dict:
@@ -96,7 +99,7 @@ class TikTokAPI:
         if response.status != 200 or error.get("code") != "ok":
             code = error.get("code", "request_failed")
             if code == "scope_not_authorized":
-                raise TikTokError("TikTok has not granted direct-post access. Enable video.publish and run /link-post.")
+                raise TikTokError("TikTok has not granted direct-post access. Enable video.publish and run /link-tiktok.")
             if code == "unaudited_client_can_only_post_to_private_accounts":
                 raise TikTokError("TikTok requires an audited app for public posts. Use a private account and Only me visibility until the app is audited.")
             raise TikTokError(f"TikTok API error: {code}")

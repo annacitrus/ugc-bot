@@ -159,6 +159,29 @@ class BotStartupTests(unittest.TestCase):
             finally:
                 bot.storage.close()
 
+    def test_only_combined_tiktok_link_command_is_registered(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            config = Config(
+                discord_token="test",
+                tiktok_client_key="test",
+                tiktok_client_secret="test",
+                tiktok_redirect_uri="https://bot.up.railway.app/oauth/callback",
+                encryption_key=Fernet.generate_key(),
+                database_path=Path(directory) / "bot.sqlite3",
+                http_host="127.0.0.1",
+                http_port=8080,
+                discord_guild_id=None,
+                max_video_bytes=100_000_000,
+            )
+            bot = UploadBot(config)
+            try:
+                commands = {command.name for command in bot.tree.get_commands()}
+                self.assertIn("link-tiktok", commands)
+                self.assertNotIn("link", commands)
+                self.assertNotIn("link-post", commands)
+            finally:
+                bot.storage.close()
+
 
 class TikTokValueTests(unittest.TestCase):
     def test_schedule_time_uses_saved_zone_and_handles_clock_changes(self):
@@ -195,9 +218,9 @@ class TikTokValueTests(unittest.TestCase):
              (40_000_000, 10_000_000), (50_000_000, 15_000_123)],
         )
 
-    def test_auth_url_uses_upload_scope_and_state(self):
+    def test_auth_url_uses_both_scopes_and_state(self):
         url = authorization_url("key", "https://example.com/oauth/callback", "random-state")
-        self.assertIn("scope=video.upload", url)
+        self.assertIn("scope=video.upload%2Cvideo.publish", url)
         self.assertIn("state=random-state", url)
 
     def test_direct_post_phrase_must_be_exact(self):
@@ -207,11 +230,32 @@ class TikTokValueTests(unittest.TestCase):
         self.assertFalse(is_direct_post_request("<@123> Post this", 123))
         self.assertFalse(is_direct_post_request("<@123> post this later", 123))
 
-    def test_direct_post_authorization_requests_both_scopes(self):
-        url = authorization_url(
-            "key", "https://example.com/oauth/callback", "random-state", ("video.upload", "video.publish")
+    def test_new_link_requires_both_scopes_but_legacy_refresh_allows_upload_only(self):
+        class TokenSession:
+            def __init__(self, scope):
+                self.scope = scope
+
+            def post(self, _url, **_kwargs):
+                return FakeResponse(200, {
+                    "scope": self.scope,
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "expires_in": 3600,
+                })
+
+        upload_only = TikTokAPI(
+            TokenSession("video.upload"), "key", "secret", "https://example.com/oauth/callback"
         )
-        self.assertIn("scope=video.upload%2Cvideo.publish", url)
+        with self.assertRaisesRegex(TikTokError, "video.publish"):
+            run_fake_coroutine(upload_only.exchange_code("code"))
+        self.assertEqual(run_fake_coroutine(upload_only.refresh("refresh"))["scope"], "video.upload")
+
+        both = TikTokAPI(
+            TokenSession("video.upload,video.publish"), "key", "secret", "https://example.com/oauth/callback"
+        )
+        self.assertEqual(
+            run_fake_coroutine(both.exchange_code("code"))["scope"], "video.upload,video.publish"
+        )
 
     def test_direct_post_requires_privacy_selection(self):
         message = SimpleNamespace(author=SimpleNamespace(id=123))
