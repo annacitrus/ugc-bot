@@ -27,7 +27,7 @@ class UploadBot(discord.Client):
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.storage = Storage(config.database_path, config.encryption_key)
-        self.http: aiohttp.ClientSession | None = None
+        self.tiktok_session: aiohttp.ClientSession | None = None
         self.tiktok: TikTokAPI | None = None
         self.web_runner: web.AppRunner | None = None
         self.user_locks: dict[int, asyncio.Lock] = {}
@@ -38,9 +38,9 @@ class UploadBot(discord.Client):
         return self.user_locks.setdefault(user_id, asyncio.Lock())
 
     async def setup_hook(self) -> None:
-        self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600))
+        self.tiktok_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600))
         self.tiktok = TikTokAPI(
-            self.http,
+            self.tiktok_session,
             self.config.tiktok_client_key,
             self.config.tiktok_client_secret,
             self.config.tiktok_redirect_uri,
@@ -63,8 +63,8 @@ class UploadBot(discord.Client):
     async def close(self) -> None:
         if self.web_runner:
             await self.web_runner.cleanup()
-        if self.http:
-            await self.http.close()
+        if self.tiktok_session:
+            await self.tiktok_session.close()
         self.storage.close()
         await super().close()
 
@@ -195,9 +195,9 @@ class UploadBot(discord.Client):
                 await progress.edit(content="Upload failed due to a network or file error. Please try again.")
 
     async def _download(self, attachment: discord.Attachment, path: Path) -> None:
-        assert self.http is not None
+        assert self.tiktok_session is not None
         total = 0
-        async with self.http.get(attachment.url) as response:
+        async with self.tiktok_session.get(attachment.url) as response:
             response.raise_for_status()
             with path.open("wb") as file:
                 async for chunk in response.content.iter_chunked(1024 * 1024):

@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from ugc_bot.config import load_config
+from ugc_bot.bot import UploadBot
+from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, authorization_url, chunk_ranges
 
@@ -83,6 +84,30 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.http_host, "0.0.0.0")
         self.assertEqual(config.http_port, 12345)
         self.assertEqual(config.database_path, Path("/data/bot.sqlite3"))
+
+
+class BotStartupTests(unittest.TestCase):
+    def test_discord_http_client_is_not_replaced(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            config = Config(
+                discord_token="test",
+                tiktok_client_key="test",
+                tiktok_client_secret="test",
+                tiktok_redirect_uri="https://bot.up.railway.app/oauth/callback",
+                encryption_key=Fernet.generate_key(),
+                database_path=Path(directory) / "bot.sqlite3",
+                http_host="127.0.0.1",
+                http_port=8080,
+                discord_guild_id=None,
+                max_video_bytes=100_000_000,
+            )
+            bot = UploadBot(config)
+            try:
+                self.assertIsNotNone(bot.http)
+                self.assertTrue(hasattr(bot.http, "loop"))
+                self.assertIsNone(bot.tiktok_session)
+            finally:
+                bot.storage.close()
 
 
 class TikTokTests(unittest.IsolatedAsyncioTestCase):
