@@ -47,15 +47,21 @@ def load_config() -> Config:
         raise ValueError("MAX_VIDEO_MB must be between 1 and 4096")
 
     guild_id = os.getenv("DISCORD_GUILD_ID")
+    railway = bool(os.getenv("RAILWAY_ENVIRONMENT_ID"))
+    default_database = (
+        str(Path(os.environ["RAILWAY_VOLUME_MOUNT_PATH"]) / "bot.sqlite3")
+        if os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+        else "bot.sqlite3"
+    )
     return Config(
         discord_token=os.environ["DISCORD_BOT_TOKEN"],
         tiktok_client_key=os.environ["TIKTOK_CLIENT_KEY"],
         tiktok_client_secret=os.environ["TIKTOK_CLIENT_SECRET"],
         tiktok_redirect_uri=redirect_uri,
         encryption_key=key,
-        database_path=Path(os.getenv("DATABASE_PATH", "bot.sqlite3")),
-        http_host=os.getenv("HTTP_HOST", "127.0.0.1"),
-        http_port=int(os.getenv("HTTP_PORT", "8080")),
+        database_path=Path(os.getenv("DATABASE_PATH", default_database)),
+        http_host="0.0.0.0" if railway else os.getenv("HTTP_HOST", "127.0.0.1"),
+        http_port=int(os.getenv("PORT") or os.getenv("HTTP_PORT", "8080")),
         discord_guild_id=int(guild_id) if guild_id else None,
         max_video_bytes=max_mb * 1_000_000,
     )

@@ -33,6 +33,17 @@ Each Discord user connects their own TikTok account with `/link`. Tokens are enc
 
 `MAX_VIDEO_MB` defaults to 100 MB. The bot stores each upload temporarily and deletes it after transfer. Keep enough free disk space for two simultaneous videos.
 
+## Deploy on Railway
+
+Railpack reads [`railpack.json`](railpack.json) and starts the bot with `python -m ugc_bot.bot`. Railway supplies `PORT`; the bot binds to `0.0.0.0` on that port when running there. The `/healthz` endpoint is available for a Railway deployment health check.
+
+1. Connect this repository to a Railway service. In **Settings → Networking**, generate a public Railway domain. In **Settings → Deploy**, set the health check path to `/healthz` if you want Railway to verify startup.
+2. In the service's **Variables**, set `DISCORD_BOT_TOKEN`, `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY`. Set `TIKTOK_REDIRECT_URI` to `https://YOUR-RAILWAY-DOMAIN/oauth/callback`, using your actual generated domain. Register that exact URI in TikTok Login Kit. Add optional `DISCORD_GUILD_ID` and `MAX_VIDEO_MB` as needed. Railway does not use your local `.env` file.
+3. Attach a persistent volume to the service, for example at `/data`. The bot automatically puts `bot.sqlite3` there when Railway supplies `RAILWAY_VOLUME_MOUNT_PATH`. Keep the encryption key stable across deploys so stored TikTok connections remain readable.
+4. Redeploy from the updated repository. Once live, `https://YOUR-RAILWAY-DOMAIN/healthz` should return `ok`. Then run `/link` in Discord.
+
+Railway hosts both the Discord process and its HTTPS callback in this setup. You do not need the Cloudflare Tunnel below if you use the Railway domain. Keep the service to one replica while it uses SQLite and a single Discord bot connection.
+
 ## Cloudflare Tunnel on Windows
 
 You need a Cloudflare account with a domain added to it. Pick a dedicated hostname such as `bot.example.com`. A named tunnel keeps this hostname stable for TikTok's registered redirect URI; a temporary Quick Tunnel URL changes and is unsuitable here. The tunnel exposes only the bot's local HTTP callback server. Discord messages and video transfers do not pass through Cloudflare. **The Python Discord bot still runs on your PC or another always-on server; Cloudflare Tunnel is not a bot host.** Cloudflare Workers would require a separate HTTP interactions implementation and a slash command instead of passive `@mention` detection.

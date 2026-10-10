@@ -1,9 +1,12 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
+from ugc_bot.config import load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, authorization_url, chunk_ranges
 
@@ -60,6 +63,26 @@ class StorageTests(unittest.TestCase):
             store.delete_tokens(123)
             self.assertIsNone(store.get_tokens(123))
             store.close()
+
+
+class ConfigTests(unittest.TestCase):
+    def test_railway_uses_public_listener_port_and_volume(self):
+        variables = {
+            "DISCORD_BOT_TOKEN": "test",
+            "TIKTOK_CLIENT_KEY": "test",
+            "TIKTOK_CLIENT_SECRET": "test",
+            "TIKTOK_REDIRECT_URI": "https://bot.up.railway.app/oauth/callback",
+            "TOKEN_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+            "RAILWAY_ENVIRONMENT_ID": "test-environment",
+            "RAILWAY_VOLUME_MOUNT_PATH": "/data",
+            "HTTP_HOST": "127.0.0.1",
+            "PORT": "12345",
+        }
+        with patch.dict(os.environ, variables, clear=True), patch("ugc_bot.config.load_dotenv"):
+            config = load_config()
+        self.assertEqual(config.http_host, "0.0.0.0")
+        self.assertEqual(config.http_port, 12345)
+        self.assertEqual(config.database_path, Path("/data/bot.sqlite3"))
 
 
 class TikTokTests(unittest.IsolatedAsyncioTestCase):
