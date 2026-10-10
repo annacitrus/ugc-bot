@@ -21,6 +21,9 @@ class Config:
     http_port: int
     discord_guild_id: int | None
     max_video_bytes: int
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_redirect_uri: str = ""
 
 
 def load_config() -> Config:
@@ -47,6 +50,16 @@ def load_config() -> Config:
         raise ValueError("MAX_VIDEO_MB must be between 1 and 4096")
 
     guild_id = os.getenv("DISCORD_GUILD_ID")
+    youtube = [os.getenv(name, "") for name in (
+        "YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REDIRECT_URI")]
+    if any(youtube):
+        if not all(youtube):
+            raise ValueError("Set all three YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI variables")
+        parsed_youtube = urlsplit(youtube[2])
+        if (parsed_youtube.scheme != "https" or not parsed_youtube.netloc
+                or parsed_youtube.path != "/oauth/youtube/callback"
+                or parsed_youtube.query or parsed_youtube.fragment):
+            raise ValueError("YOUTUBE_REDIRECT_URI must be HTTPS and end in /oauth/youtube/callback")
     railway = bool(os.getenv("RAILWAY_ENVIRONMENT_ID"))
     default_database = (
         str(Path(os.environ["RAILWAY_VOLUME_MOUNT_PATH"]) / "bot.sqlite3")
@@ -64,4 +77,7 @@ def load_config() -> Config:
         http_port=int(os.getenv("PORT") or os.getenv("HTTP_PORT", "8080")),
         discord_guild_id=int(guild_id) if guild_id else None,
         max_video_bytes=max_mb * 1_000_000,
+        youtube_client_id=youtube[0],
+        youtube_client_secret=youtube[1],
+        youtube_redirect_uri=youtube[2],
     )

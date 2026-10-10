@@ -19,6 +19,12 @@ from discord import app_commands
 from .config import Config, load_config
 from .storage import Storage
 from .tiktok import MIME_TYPES, TikTokAPI, TikTokError, authorization_url
+from .youtube import (
+    YouTubeAPI,
+    YouTubeError,
+    authorization_url as youtube_authorization_url,
+    validate_metadata as validate_youtube_metadata,
+)
 
 
 log = logging.getLogger(__name__)
@@ -307,6 +313,101 @@ class DirectPostView(discord.ui.View):
         await interaction.response.send_modal(ScheduleModal(self, interaction.message, time_zone))
 
 
+class YouTubeDetailsModal(discord.ui.Modal, title="YouTube video details"):
+    video_title = discord.ui.TextInput(label="Title", max_length=100)
+    description = discord.ui.TextInput(label="Description (optional)", style=discord.TextStyle.paragraph,
+                                       required=False, max_length=4000)
+
+    def __init__(self, post_view: YouTubePostView):
+        super().__init__()
+        self.post_view = post_view
+        self.video_title.default = post_view.title
+        self.description.default = post_view.description
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.post_view.interaction_check(interaction):
+            return
+        if self.post_view.submitted or self.post_view.is_finished():
+            await interaction.response.send_message("This YouTube panel has closed. Send the video again for a new post.", ephemeral=True)
+            return
+        title, description = str(self.video_title.value), str(self.description.value)
+        try:
+            validate_youtube_metadata(title, description)
+        except YouTubeError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.post_view.title, self.post_view.description = title, description
+        await interaction.response.send_message("YouTube title and description saved for this video.", ephemeral=True)
+
+
+class YouTubePostView(discord.ui.View):
+    def __init__(self, bot: UploadBot, message: discord.Message):
+        super().__init__(timeout=600)
+        self.bot, self.message = bot, message
+        self.title = ""
+        self.description = ""
+        self.privacy: str | None = None
+        self.made_for_kids: bool | None = None
+        self.submitted = False
+        privacy = discord.ui.Select(placeholder="YouTube: who can see this video?", row=0, options=[
+            discord.SelectOption(label=name.title(), value=name) for name in ("private", "unlisted", "public")])
+
+        async def set_privacy(interaction: discord.Interaction) -> None:
+            self.privacy = privacy.values[0]
+            await interaction.response.defer()
+
+        privacy.callback = set_privacy
+        self.add_item(privacy)
+        audience = discord.ui.Select(placeholder="YouTube: is this video made for kids?", row=1, options=[
+            discord.SelectOption(label="Yes, made for kids", value="yes"),
+            discord.SelectOption(label="No, not made for kids", value="no"),
+        ])
+
+        async def set_audience(interaction: discord.Interaction) -> None:
+            self.made_for_kids = audience.values[0] == "yes"
+            await interaction.response.defer()
+
+        audience.callback = set_audience
+        self.add_item(audience)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.message.author.id:
+            await interaction.response.send_message("Only the person who attached the video can post it.", ephemeral=True)
+            return False
+        return True
+
+    def selection_error(self) -> str | None:
+        try:
+            validate_youtube_metadata(self.title, self.description)
+        except YouTubeError as exc:
+            return str(exc)
+        if self.privacy is None:
+            return "Choose YouTube visibility before posting."
+        if self.made_for_kids is None:
+            return "Choose whether the YouTube video is made for kids before posting."
+        return None
+
+    @discord.ui.button(label="Edit YouTube details", style=discord.ButtonStyle.secondary, row=2)
+    async def edit_details(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(YouTubeDetailsModal(self))
+
+    @discord.ui.button(label="Post to YouTube", style=discord.ButtonStyle.primary, row=2)
+    async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.submitted:
+            await interaction.response.send_message("This YouTube video is already being sent.", ephemeral=True)
+            return
+        error = self.selection_error()
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        self.submitted = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Sending your video to YouTube…", view=self)
+        await self.bot.post_youtube_video(interaction.message, self.message, self)
+
+
 class UploadBot(discord.Client):
     def __init__(self, config: Config):
         intents = discord.Intents.default()
@@ -319,6 +420,7 @@ class UploadBot(discord.Client):
         self.scheduled_task: asyncio.Task | None = None
         self.tiktok_session: aiohttp.ClientSession | None = None
         self.tiktok: TikTokAPI | None = None
+        self.youtube: YouTubeAPI | None = None
         self.web_runner: web.AppRunner | None = None
         self.user_locks: dict[int, asyncio.Lock] = {}
         self.upload_slots = asyncio.Semaphore(2)
@@ -336,6 +438,10 @@ class UploadBot(discord.Client):
             self.config.tiktok_redirect_uri,
         )
         app = web.Application()
+        if self.config.youtube_client_id:
+            self.youtube = YouTubeAPI(self.tiktok_session, self.config.youtube_client_id,
+                                      self.config.youtube_client_secret, self.config.youtube_redirect_uri)
+        app.router.add_get("/oauth/youtube/callback", self.youtube_oauth_callback)
         app.router.add_get("/oauth/callback", self.oauth_callback)
         app.router.add_get("/healthz", lambda _: web.Response(text="ok"))
         self.web_runner = web.AppRunner(app)
@@ -365,6 +471,29 @@ class UploadBot(discord.Client):
         await super().close()
 
     def _register_commands(self) -> None:
+        @self.tree.command(name="link-youtube", description="Connect your YouTube channel for Shorts uploads")
+        async def link_youtube(interaction: discord.Interaction) -> None:
+            if self.youtube is None:
+                await interaction.response.send_message("YouTube uploads have not been configured by the bot owner.", ephemeral=True)
+                return
+            state = self.storage.new_state(interaction.user.id, youtube=True)
+            url = youtube_authorization_url(self.config.youtube_client_id, self.config.youtube_redirect_uri, state)
+            await interaction.response.send_message("Connect your YouTube channel (link expires in 10 minutes):\n" + url, ephemeral=True)
+
+        @self.tree.command(name="unlink-youtube", description="Disconnect your YouTube channel")
+        async def unlink_youtube(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            async with self._lock(interaction.user.id):
+                tokens = self.storage.get_tokens(interaction.user.id, youtube=True)
+                try:
+                    if tokens and self.youtube:
+                        await self.youtube.revoke(tokens.get("refresh_token") or tokens["access_token"])
+                except (YouTubeError, aiohttp.ClientError, asyncio.TimeoutError):
+                    await interaction.followup.send("Could not revoke YouTube access. Try `/unlink-youtube` again.", ephemeral=True)
+                    return
+                self.storage.delete_tokens(interaction.user.id, youtube=True)
+            await interaction.followup.send("YouTube disconnected.", ephemeral=True)
+
         @self.tree.command(name="link-tiktok", description="Connect TikTok for posting and scheduling videos")
         async def link_tiktok(interaction: discord.Interaction) -> None:
             state = self.storage.new_state(interaction.user.id)
@@ -460,6 +589,23 @@ class UploadBot(discord.Client):
                 ephemeral=True,
             )
 
+    async def youtube_oauth_callback(self, request: web.Request) -> web.Response:
+        state = request.query.get("state", "")
+        user_id = self.storage.consume_state(state, youtube=True) if state else None
+        if user_id is None or self.youtube is None:
+            return web.Response(status=400, text="Invalid or expired link. Run /link-youtube again.")
+        if request.query.get("error") or not request.query.get("code"):
+            return web.Response(status=400, text="YouTube authorization was not completed. Run /link-youtube again.")
+        try:
+            async with self._lock(user_id):
+                tokens = await self.youtube.exchange_code(request.query["code"])
+                self.storage.save_tokens(user_id, tokens, youtube=True)
+        except YouTubeError as exc:
+            return web.Response(status=400, text=str(exc))
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return web.Response(status=502, text="YouTube connection failed. Run /link-youtube again.")
+        return web.Response(text="YouTube connected. Return to Discord and @mention ghostpost with one video file.")
+
     async def oauth_callback(self, request: web.Request) -> web.Response:
         state = request.query.get("state", "")
         user_id = self.storage.consume_state(state) if state else None
@@ -513,12 +659,33 @@ class UploadBot(discord.Client):
             limit = self.config.max_video_bytes // 1_000_000
             await message.reply(f"Video must be between 1 byte and {limit} MB.", mention_author=False)
             return
-        if not self.storage.get_tokens(message.author.id):
-            await message.reply("Run `/link-tiktok` to connect your TikTok account first.", mention_author=False)
+        tiktok_connected = self.storage.get_tokens(message.author.id) is not None
+        youtube_connected = self.storage.get_tokens(message.author.id, youtube=True) is not None
+        if not tiktok_connected and not youtube_connected:
+            await message.reply(
+                "Connect your accounts with `/link-tiktok` and/or `/link-youtube`, then @mention me with one video. "
+                "You can post to either platform or both.", mention_author=False)
             return
+        if tiktok_connected:
+            await self._prepare_tiktok_post(message)
+        if youtube_connected:
+            if self.youtube is None:
+                await message.reply("YouTube uploads have not been configured by the bot owner.", mention_author=False)
+                return
+            await message.reply(
+                f"Post **{message.attachments[0].filename}** to your linked **YouTube channel**. "
+                "Use **Edit YouTube details** to enter a title and optional description, then choose visibility "
+                "and whether the video is made for kids. Press **Post to YouTube** when ready. "
+                "Square or vertical videos up to three minutes are eligible for Shorts. "
+                "YouTube determines classification and processes the video after transfer. "
+                "This panel posts to YouTube; use the TikTok panel too if you want both. "
+                "Connect TikTok with `/link-tiktok` if needed.",
+                mention_author=False, view=YouTubePostView(self, message))
 
+    async def _prepare_tiktok_post(self, message: discord.Message) -> None:
+        attachment = message.attachments[0]
         tokens = self.storage.get_tokens(message.author.id)
-        if "video.publish" not in {scope.strip() for scope in tokens.get("scope", "").split(",")}:
+        if not tokens or "video.publish" not in {scope.strip() for scope in tokens.get("scope", "").split(",")}:
             await message.reply(
                 "Direct posting needs TikTok's `video.publish` permission. Run `/link-tiktok` again.",
                 mention_author=False,
@@ -541,16 +708,50 @@ class UploadBot(discord.Client):
             "Scheduling time zone: not set. Enter a UTC offset or use `/set-time-zone` first."
         )
         await message.reply(
-            f"Post **{attachment.filename}** to **{account}**. Choose privacy, review the options, "
+            f"Post **{attachment.filename}** to **{account}** on **TikTok**. Choose privacy, review the options, "
             "then choose **Post now** or **Schedule post**. By posting, you agree to TikTok's "
             "[Music Usage Confirmation](https://www.tiktok.com/legal/page/global/music-usage-confirmation/en). "
             "For branded content, you also agree to TikTok's "
             "[Branded Content Policy](https://www.tiktok.com/legal/page/global/bc-policy/en). "
             "Unaudited apps can only post privately to private TikTok accounts. "
-            "The video may take a few minutes to appear on your profile.\n" + schedule_hint,
+            "The video may take a few minutes to appear on your profile. "
+            "This panel posts to TikTok; use the YouTube panel too if you want both. "
+            "Connect YouTube with `/link-youtube` if needed.\n" + schedule_hint,
             mention_author=False,
             view=view,
         )
+
+    async def post_youtube_video(
+        self, progress: discord.Message, message: discord.Message, settings: YouTubePostView
+    ) -> None:
+        video = message.attachments[0]
+        suffix = Path(video.filename).suffix.lower()
+        try:
+            if self.youtube is None:
+                raise YouTubeError("YouTube uploads have not been configured by the bot owner.")
+            error = settings.selection_error()
+            if error:
+                raise YouTubeError(error)
+            async with self.upload_slots, self._lock(message.author.id):
+                tokens = self.storage.get_tokens(message.author.id, youtube=True)
+                if not tokens:
+                    raise YouTubeError("Run /link-youtube to connect your channel first.")
+                if int(tokens["expires_at"]) <= int(time.time()) + 60:
+                    tokens = await self.youtube.refresh(tokens["refresh_token"])
+                    self.storage.save_tokens(message.author.id, tokens, youtube=True)
+                with tempfile.TemporaryDirectory(prefix="ugc-bot-youtube-") as directory:
+                    path = Path(directory) / ("video" + suffix)
+                    await self._download(video, path)
+                    video_id = await self.youtube.post_video(tokens["access_token"], path, MIME_TYPES[suffix],
+                                                             settings.title, settings.description,
+                                                             settings.privacy, settings.made_for_kids)
+            await progress.edit(content=f"Uploaded to YouTube: https://www.youtube.com/watch?v={video_id}\n"
+                                "YouTube is processing the video and determines Shorts eligibility.")
+        except (YouTubeError, TikTokError) as exc:
+            await progress.edit(content=str(exc))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            log.warning("YouTube upload interrupted for Discord user %s", message.author.id)
+            await progress.edit(content="YouTube upload interrupted. Check your channel before retrying to avoid duplicates.")
 
     async def post_direct_video(
         self, progress: discord.Message, message: discord.Message, settings: DirectPostView

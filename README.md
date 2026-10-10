@@ -1,10 +1,24 @@
-# Discord → TikTok video uploader
+# Discord → TikTok and YouTube video uploader
 
-Mention the bot in Discord or DM it with **one MP4, MOV, or WebM attachment**. The bot opens a posting panel where you choose privacy and other options, then press **Post now** or **Schedule post**. The video is sent to TikTok only after you choose one of those actions.
+Mention **@ghostpost** in Discord or DM it with **one MP4, MOV, or WebM attachment**. The bot opens a posting panel for each linked platform. Answer the TikTok and/or YouTube questions, then confirm posting in the corresponding panel. You can post the same file to either platform or both. No video is uploaded until you press a post button (or schedule a TikTok post).
 
-Each Discord user connects their own TikTok account with `/link-tiktok`. Tokens are encrypted in a local SQLite database; `/unlink` removes the connection.
+Each Discord user connects their own TikTok account with `/link-tiktok` and YouTube channel with `/link-youtube`. Tokens are encrypted in a local SQLite database; `/unlink` removes TikTok and `/unlink-youtube` removes YouTube.
 
 ## Set up
+
+### YouTube Shorts direct uploads
+
+Enable **YouTube Data API v3** in a Google Cloud project, configure the OAuth consent screen (add your Google account as a test user while testing), and create an OAuth client of type **Web application**. Register `https://YOUR-DOMAIN/oauth/youtube/callback` as an authorized redirect URI. Use the same public host as the bot's existing callback server.
+
+Set `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET`, and `YOUTUBE_REDIRECT_URI` in `.env` or Railway variables and restart the bot. These settings are optional; existing TikTok configuration is still required. YouTube connections and one-time OAuth states are stored separately from TikTok, with tokens encrypted using the existing encryption key.
+
+Run `/link-youtube`, select the intended Google account/channel, and grant upload permission. Then **@mention ghostpost with a video file**, or DM it the video. In the YouTube panel, use **Edit YouTube details** to enter a title and optional description. Choose visibility (`private`, `unlisted`, or `public`) and explicitly answer whether the video is **made for kids**. Press **Post to YouTube** to upload directly. The bot returns a video link after transfer; YouTube processing continues afterward. If TikTok is also linked, its separate panel offers the existing caption, privacy, interaction, commercial disclosure, posting and scheduling choices. Each panel confirms its own platform, so posting to YouTube does not submit or disable TikTok and vice versa. Panels expire after ten minutes and only the video sender can use them. `/unlink-youtube` revokes Google authorization and removes the saved YouTube connection; `/unlink` continues to affect TikTok only. YouTube scheduling is not included.
+
+YouTube uses its standard [video upload API](https://developers.google.com/youtube/v3/docs/videos/insert) for Shorts. [Square or vertical videos up to three minutes](https://support.google.com/youtube/answer/15424877) are classified as Shorts by YouTube; this bot does not crop or shorten videos or guarantee Shorts classification. [Testing-mode refresh tokens expire after seven days](https://developers.google.com/identity/protocols/oauth2#expiration), requiring `/link-youtube` again.
+
+Uploads use Google's [resumable transfer protocol](https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol), share the configured `MAX_VIDEO_MB` limit, and remove temporary videos after transfer. Interrupted transfers are not retried automatically; check your channel before resubmitting to avoid duplicates.
+
+### Discord and TikTok setup
 
 1. Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Invite it with the `bot` and `applications.commands` scopes, and give it View Channels, Read Message History, and Send Messages permissions. The bot handles messages that directly @mention it; it does not request Discord's Message Content intent.
 2. Create a TikTok developer app, add **Login Kit** and **Content Posting API**, and enable/obtain the `video.upload` scope. For direct posts, also enable **Direct Post** and obtain approval for `video.publish`. Register an **HTTPS** Login Kit redirect URI ending in `/oauth/callback`, for example `https://bot.example.com/oauth/callback`. Set up the Cloudflare Tunnel below so TikTok can reach it.

@@ -25,6 +25,15 @@ class Storage:
                 discord_user_id TEXT PRIMARY KEY,
                 encrypted_tokens BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS youtube_accounts (
+                discord_user_id TEXT PRIMARY KEY,
+                encrypted_tokens BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS youtube_oauth_states (
+                state TEXT PRIMARY KEY,
+                discord_user_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS user_settings (
                 discord_user_id TEXT PRIMARY KEY,
                 time_zone TEXT NOT NULL
@@ -48,43 +57,48 @@ class Storage:
         )
         self.crypto = Fernet(encryption_key)
 
-    def new_state(self, discord_user_id: int) -> str:
+    def new_state(self, discord_user_id: int, *, youtube: bool = False) -> str:
+        table = "youtube_oauth_states" if youtube else "oauth_states"
         state = secrets.token_urlsafe(32)
         with self.db:
-            self.db.execute("DELETE FROM oauth_states WHERE expires_at < ?", (int(time.time()),))
+            self.db.execute(f"DELETE FROM {table} WHERE expires_at < ?", (int(time.time()),))
             self.db.execute(
-                "INSERT INTO oauth_states VALUES (?, ?, ?)",
+                f"INSERT INTO {table} VALUES (?, ?, ?)",
                 (state, str(discord_user_id), int(time.time()) + 600),
             )
         return state
 
-    def consume_state(self, state: str) -> int | None:
+    def consume_state(self, state: str, *, youtube: bool = False) -> int | None:
+        table = "youtube_oauth_states" if youtube else "oauth_states"
         with self.db:
             row = self.db.execute(
-                "DELETE FROM oauth_states WHERE state = ? AND expires_at >= ? RETURNING discord_user_id",
+                f"DELETE FROM {table} WHERE state = ? AND expires_at >= ? RETURNING discord_user_id",
                 (state, int(time.time())),
             ).fetchone()
         return int(row[0]) if row else None
 
-    def save_tokens(self, discord_user_id: int, tokens: dict) -> None:
+    def save_tokens(self, discord_user_id: int, tokens: dict, *, youtube: bool = False) -> None:
+        table = "youtube_accounts" if youtube else "accounts"
         ciphertext = self.crypto.encrypt(json.dumps(tokens).encode("utf-8"))
         with self.db:
             self.db.execute(
-                "INSERT INTO accounts VALUES (?, ?) ON CONFLICT(discord_user_id) "
+                f"INSERT INTO {table} VALUES (?, ?) ON CONFLICT(discord_user_id) "
                 "DO UPDATE SET encrypted_tokens = excluded.encrypted_tokens",
                 (str(discord_user_id), ciphertext),
             )
 
-    def get_tokens(self, discord_user_id: int) -> dict | None:
+    def get_tokens(self, discord_user_id: int, *, youtube: bool = False) -> dict | None:
+        table = "youtube_accounts" if youtube else "accounts"
         row = self.db.execute(
-            "SELECT encrypted_tokens FROM accounts WHERE discord_user_id = ?",
+            f"SELECT encrypted_tokens FROM {table} WHERE discord_user_id = ?",
             (str(discord_user_id),),
         ).fetchone()
         return json.loads(self.crypto.decrypt(row[0])) if row else None
 
-    def delete_tokens(self, discord_user_id: int) -> None:
+    def delete_tokens(self, discord_user_id: int, *, youtube: bool = False) -> None:
+        table = "youtube_accounts" if youtube else "accounts"
         with self.db:
-            self.db.execute("DELETE FROM accounts WHERE discord_user_id = ?", (str(discord_user_id),))
+            self.db.execute(f"DELETE FROM {table} WHERE discord_user_id = ?", (str(discord_user_id),))
 
     def set_time_zone(self, discord_user_id: int, time_zone: str) -> None:
         with self.db:
