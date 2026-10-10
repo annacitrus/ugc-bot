@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet
 from ugc_bot.bot import CaptionModal, DirectPostView, UploadBot, is_direct_post_request
 from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
-from ugc_bot.tiktok import TikTokAPI, authorization_url, chunk_ranges
+from ugc_bot.tiktok import TikTokAPI, TikTokError, authorization_url, chunk_ranges
 
 
 class FakeResponse:
@@ -29,8 +29,9 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self):
+    def __init__(self, upload_url="https://open-upload.tiktokapis.com/video/?upload_id=test&upload_token=test"):
         self.uploads = []
+        self.upload_url = upload_url
 
     def post(self, url, **kwargs):
         self.init_url = url
@@ -41,7 +42,7 @@ class FakeSession:
                 "error": {"code": "ok"},
                 "data": {
                     "publish_id": "test-publish-id",
-                    "upload_url": "https://open-upload.tiktokapis.com/video/?upload_id=test&upload_token=test",
+                    "upload_url": self.upload_url,
                 },
             },
         )
@@ -166,6 +167,39 @@ class TikTokValueTests(unittest.TestCase):
 
 
 class TikTokUploadTests(unittest.TestCase):
+    def test_missing_upload_url_is_distinct_from_untrusted_url(self):
+        session = FakeSession(upload_url=None)
+        api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"test-video")
+            with self.assertRaisesRegex(TikTokError, "did not return an upload URL"):
+                run_fake_coroutine(api.post_video("access-token", path, "video/mp4", {"privacy_level": "SELF_ONLY"}))
+        self.assertEqual(session.uploads, [])
+
+    def test_tiktok_supplied_https_upload_host_is_used(self):
+        upload_url = "https://upload.cdn.example.com/video/?upload_token=secret-token"
+        session = FakeSession(upload_url=upload_url)
+        api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"test-video")
+            with patch("ugc_bot.tiktok.asyncio.to_thread", run_inline):
+                run_fake_coroutine(api.post_video("access-token", path, "video/mp4", {"privacy_level": "SELF_ONLY"}))
+        self.assertEqual(session.uploads[0][0], upload_url)
+
+    def test_local_upload_url_reports_only_hostname(self):
+        session = FakeSession(upload_url="https://127.0.0.1/video/?upload_token=secret-token")
+        api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"test-video")
+            with self.assertRaises(TikTokError) as raised:
+                run_fake_coroutine(api.post_video("access-token", path, "video/mp4", {"privacy_level": "SELF_ONLY"}))
+        self.assertIn("127.0.0.1", str(raised.exception))
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertEqual(session.uploads, [])
+
     def test_inbox_upload_sends_exact_range(self):
         session = FakeSession()
         api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")

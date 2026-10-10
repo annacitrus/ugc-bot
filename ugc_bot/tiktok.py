@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import time
 from pathlib import Path
@@ -134,10 +135,33 @@ class TikTokAPI:
             access_token,
             payload,
         )
-        upload_url = init.get("upload_url", "")
-        parsed = urlsplit(upload_url)
-        if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".tiktokapis.com"):
-            raise TikTokError("TikTok returned an unexpected upload URL")
+        upload_url = init.get("upload_url")
+        if not isinstance(upload_url, str) or not upload_url:
+            raise TikTokError("TikTok did not return an upload URL")
+        try:
+            parsed = urlsplit(upload_url)
+            port = parsed.port
+        except ValueError as exc:
+            raise TikTokError("TikTok returned a malformed upload URL") from exc
+        hostname = parsed.hostname
+        try:
+            ipaddress.ip_address(hostname or "")
+        except ValueError:
+            is_ip_address = False
+        else:
+            is_ip_address = True
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or "." not in hostname
+            or hostname.endswith((".localhost", ".local", ".internal"))
+            or is_ip_address
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or parsed.fragment
+        ):
+            raise TikTokError(f"TikTok returned an unexpected upload URL (host: {hostname or 'none'})")
         publish_id = init.get("publish_id")
         if not publish_id:
             raise TikTokError("TikTok did not return an upload ID")
