@@ -2,11 +2,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from ugc_bot.bot import UploadBot
+from ugc_bot.bot import CaptionModal, DirectPostView, UploadBot, is_direct_post_request
 from ugc_bot.config import Config, load_config
 from ugc_bot.storage import Storage
 from ugc_bot.tiktok import TikTokAPI, authorization_url, chunk_ranges
@@ -32,6 +33,7 @@ class FakeSession:
         self.uploads = []
 
     def post(self, url, **kwargs):
+        self.init_url = url
         self.init_payload = kwargs["json"]
         return FakeResponse(
             200,
@@ -47,6 +49,21 @@ class FakeSession:
     def put(self, url, **kwargs):
         self.uploads.append((url, kwargs))
         return FakeResponse(201)
+
+
+async def run_inline(function, *args):
+    return function(*args)
+
+
+def run_fake_coroutine(coroutine):
+    # Fake responses complete immediately, so this exercises async code without a network event loop.
+    try:
+        coroutine.send(None)
+    except StopIteration as finished:
+        return finished.value
+    else:
+        coroutine.close()
+        raise AssertionError("Fake API unexpectedly waited for external I/O")
 
 
 class StorageTests(unittest.TestCase):
@@ -110,7 +127,7 @@ class BotStartupTests(unittest.TestCase):
                 bot.storage.close()
 
 
-class TikTokTests(unittest.IsolatedAsyncioTestCase):
+class TikTokValueTests(unittest.TestCase):
     def test_chunk_boundaries(self):
         self.assertEqual(chunk_ranges(4_000_000), [(0, 4_000_000)])
         self.assertEqual(chunk_ranges(64_000_000), [(0, 64_000_000)])
@@ -121,19 +138,60 @@ class TikTokTests(unittest.IsolatedAsyncioTestCase):
              (40_000_000, 10_000_000), (50_000_000, 15_000_123)],
         )
 
-    async def test_inbox_upload_sends_exact_range(self):
+    def test_auth_url_uses_upload_scope_and_state(self):
+        url = authorization_url("key", "https://example.com/oauth/callback", "random-state")
+        self.assertIn("scope=video.upload", url)
+        self.assertIn("state=random-state", url)
+
+    def test_direct_post_phrase_must_be_exact(self):
+        self.assertTrue(is_direct_post_request("<@123> post this", 123))
+        self.assertTrue(is_direct_post_request("post this <@!123>", 123))
+        self.assertFalse(is_direct_post_request("<@123> please post this", 123))
+        self.assertFalse(is_direct_post_request("<@123> Post this", 123))
+        self.assertFalse(is_direct_post_request("<@123> post this later", 123))
+
+    def test_direct_post_authorization_requests_both_scopes(self):
+        url = authorization_url(
+            "key", "https://example.com/oauth/callback", "random-state", ("video.upload", "video.publish")
+        )
+        self.assertIn("scope=video.upload%2Cvideo.publish", url)
+
+    def test_direct_post_requires_privacy_selection(self):
+        message = SimpleNamespace(author=SimpleNamespace(id=123))
+        view = DirectPostView(None, message, {"privacy_level_options": ["SELF_ONLY"]})
+        self.assertIsNone(view.privacy)
+        self.assertFalse(view.submitted)
+        self.assertEqual(view.commercial, "none")
+        self.assertEqual(CaptionModal(view).caption.default, "")
+
+
+class TikTokUploadTests(unittest.TestCase):
+    def test_inbox_upload_sends_exact_range(self):
         session = FakeSession()
         api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "video.mp4"
             path.write_bytes(b"test-video")
-            publish_id = await api.upload_video("access-token", path, "video/mp4")
+            with patch("ugc_bot.tiktok.asyncio.to_thread", run_inline):
+                publish_id = run_fake_coroutine(api.upload_video("access-token", path, "video/mp4"))
         self.assertEqual(publish_id, "test-publish-id")
         self.assertEqual(session.init_payload["source_info"]["video_size"], 10)
         self.assertEqual(session.uploads[0][1]["headers"]["Content-Range"], "bytes 0-9/10")
         self.assertEqual(session.uploads[0][1]["data"], b"test-video")
 
-    def test_auth_url_uses_upload_scope_and_state(self):
-        url = authorization_url("key", "https://example.com/oauth/callback", "random-state")
-        self.assertIn("scope=video.upload", url)
-        self.assertIn("state=random-state", url)
+    def test_direct_post_uses_publish_endpoint_and_metadata(self):
+        session = FakeSession()
+        api = TikTokAPI(session, "key", "secret", "https://example.com/oauth/callback")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"test-video")
+            with patch("ugc_bot.tiktok.asyncio.to_thread", run_inline):
+                publish_id = run_fake_coroutine(
+                    api.post_video(
+                        "access-token", path, "video/mp4", {"privacy_level": "SELF_ONLY", "title": "My video"}
+                    )
+                )
+        self.assertEqual(publish_id, "test-publish-id")
+        self.assertTrue(session.init_url.endswith("/v2/post/publish/video/init/"))
+        self.assertEqual(session.init_payload["post_info"]["privacy_level"], "SELF_ONLY")
+        self.assertEqual(session.uploads[0][1]["data"], b"test-video")

@@ -19,11 +19,13 @@ class TikTokError(Exception):
     pass
 
 
-def authorization_url(client_key: str, redirect_uri: str, state: str) -> str:
+def authorization_url(
+    client_key: str, redirect_uri: str, state: str, scopes: tuple[str, ...] = ("video.upload",)
+) -> str:
     return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(
         {
             "client_key": client_key,
-            "scope": "video.upload",
+            "scope": ",".join(scopes),
             "response_type": "code",
             "redirect_uri": redirect_uri,
             "state": state,
@@ -61,7 +63,7 @@ class TikTokAPI:
         if response.status != 200 or "error" in body:
             code = body.get("error", "token_request_failed")
             raise TikTokError(f"TikTok authorization failed: {code}")
-        if "video.upload" not in body.get("scope", "").split(","):
+        if "video.upload" not in {scope.strip() for scope in body.get("scope", "").split(",")}:
             raise TikTokError("TikTok did not grant video.upload permission")
         body["expires_at"] = int(time.time()) + int(body["expires_in"])
         return body
@@ -92,23 +94,45 @@ class TikTokAPI:
         error = body.get("error", {})
         if response.status != 200 or error.get("code") != "ok":
             code = error.get("code", "request_failed")
+            if code == "scope_not_authorized":
+                raise TikTokError("TikTok has not granted direct-post access. Enable video.publish and run /link-post.")
+            if code == "unaudited_client_can_only_post_to_private_accounts":
+                raise TikTokError("TikTok requires an audited app for public posts. Use a private account and Only me visibility until the app is audited.")
             raise TikTokError(f"TikTok API error: {code}")
         return body.get("data", {})
 
+    async def creator_info(self, access_token: str) -> dict:
+        return await self._post("/v2/post/publish/creator_info/query/", access_token, {})
+
     async def upload_video(self, access_token: str, path: Path, mime_type: str) -> str:
+        return await self._send_video(
+            "/v2/post/publish/inbox/video/init/", access_token, path, mime_type, None
+        )
+
+    async def post_video(self, access_token: str, path: Path, mime_type: str, post_info: dict) -> str:
+        return await self._send_video(
+            "/v2/post/publish/video/init/", access_token, path, mime_type, post_info
+        )
+
+    async def _send_video(
+        self, endpoint: str, access_token: str, path: Path, mime_type: str, post_info: dict | None
+    ) -> str:
         size = path.stat().st_size
         ranges = chunk_ranges(size)
+        payload = {
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": size,
+                "chunk_size": ranges[0][1] if len(ranges) == 1 else CHUNK_SIZE,
+                "total_chunk_count": len(ranges),
+            }
+        }
+        if post_info is not None:
+            payload["post_info"] = post_info
         init = await self._post(
-            "/v2/post/publish/inbox/video/init/",
+            endpoint,
             access_token,
-            {
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": size,
-                    "chunk_size": ranges[0][1] if len(ranges) == 1 else CHUNK_SIZE,
-                    "total_chunk_count": len(ranges),
-                }
-            },
+            payload,
         )
         upload_url = init.get("upload_url", "")
         parsed = urlsplit(upload_url)
