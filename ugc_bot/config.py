@@ -24,6 +24,7 @@ class Config:
     youtube_client_id: str = ""
     youtube_client_secret: str = ""
     youtube_redirect_uri: str = ""
+    ffprobe_path: str = "ffprobe"
 
 
 def load_config() -> Config:
@@ -80,4 +81,5 @@ def load_config() -> Config:
         youtube_client_id=youtube[0],
         youtube_client_secret=youtube[1],
         youtube_redirect_uri=youtube[2],
+        ffprobe_path=os.getenv("FFPROBE_PATH") or "ffprobe",
     )

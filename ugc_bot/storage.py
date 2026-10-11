@@ -49,12 +49,18 @@ class Storage:
                 created_at INTEGER NOT NULL,
                 state TEXT NOT NULL DEFAULT 'pending',
                 publish_id TEXT,
-                error TEXT
+                error TEXT,
+                platform TEXT NOT NULL DEFAULT 'tiktok'
             );
             CREATE INDEX IF NOT EXISTS scheduled_posts_due
                 ON scheduled_posts(state, scheduled_at);
             """
         )
+        # Existing queues predate YouTube and contain TikTok posts only.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(scheduled_posts)")}
+        if "platform" not in columns:
+            with self.db:
+                self.db.execute("ALTER TABLE scheduled_posts ADD COLUMN platform TEXT NOT NULL DEFAULT 'tiktok'")
         self.crypto = Fernet(encryption_key)
 
     def new_state(self, discord_user_id: int, *, youtube: bool = False) -> str:
@@ -118,26 +124,29 @@ class Storage:
     def add_scheduled_post(
         self, post_id: str, discord_user_id: int, video_name: str,
         original_name: str, mime_type: str, post_info: dict, scheduled_at: int,
+        *, platform: str = "tiktok",
     ) -> None:
+        if platform not in {"tiktok", "youtube"}:
+            raise ValueError("Unknown scheduled post platform")
         with self.db:
             self.db.execute(
                 "INSERT INTO scheduled_posts "
-                "(id, discord_user_id, video_name, original_name, mime_type, post_info, scheduled_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(id, discord_user_id, video_name, original_name, mime_type, post_info, scheduled_at, created_at, platform) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (post_id, str(discord_user_id), video_name, original_name, mime_type,
-                 json.dumps(post_info), scheduled_at, int(time.time())),
+                 json.dumps(post_info), scheduled_at, int(time.time()), platform),
             )
 
     def list_scheduled_posts(self, discord_user_id: int) -> list[dict]:
         rows = self.db.execute(
             "SELECT id, video_name, original_name, mime_type, post_info, scheduled_at, "
-            "state, publish_id, error FROM scheduled_posts WHERE discord_user_id = ? "
+            "state, publish_id, error, platform FROM scheduled_posts WHERE discord_user_id = ? "
             "ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END, "
             "CASE WHEN state = 'pending' THEN scheduled_at END ASC, created_at DESC LIMIT 30",
             (str(discord_user_id),),
         ).fetchall()
         keys = ("id", "video_name", "original_name", "mime_type", "post_info", "scheduled_at",
-                "state", "publish_id", "error")
+                "state", "publish_id", "error", "platform")
         return [dict(zip(keys, row)) for row in rows]
 
     def active_scheduled_count(self, discord_user_id: int) -> int:
@@ -155,25 +164,25 @@ class Storage:
             ).fetchone()
         return row[0] if row else None
 
-    def cancel_all_scheduled_posts(self, discord_user_id: int) -> list[str]:
+    def cancel_all_scheduled_posts(self, discord_user_id: int, *, platform: str = "tiktok") -> list[str]:
         with self.db:
             rows = self.db.execute(
-                "DELETE FROM scheduled_posts WHERE discord_user_id = ? AND state = 'pending' "
+                "DELETE FROM scheduled_posts WHERE discord_user_id = ? AND platform = ? AND state = 'pending' "
                 "RETURNING video_name",
-                (str(discord_user_id),),
+                (str(discord_user_id), platform),
             ).fetchall()
         return [row[0] for row in rows]
 
     def due_scheduled_posts(self, now: int) -> list[dict]:
         rows = self.db.execute(
             "SELECT id, discord_user_id, video_name, mime_type, post_info, scheduled_at, "
-            "state, publish_id FROM scheduled_posts "
+            "state, publish_id, platform FROM scheduled_posts "
             "WHERE (state = 'pending' AND scheduled_at <= ?) OR state = 'submitted' "
             "ORDER BY scheduled_at",
             (now,),
         ).fetchall()
         keys = ("id", "discord_user_id", "video_name", "mime_type", "post_info",
-                "scheduled_at", "state", "publish_id")
+                "scheduled_at", "state", "publish_id", "platform")
         return [dict(zip(keys, row)) for row in rows]
 
     def claim_scheduled_post(self, post_id: str) -> bool:
@@ -197,7 +206,8 @@ class Storage:
         with self.db:
             rows = self.db.execute(
                 "UPDATE scheduled_posts SET state = 'uncertain', "
-                "error = 'Bot stopped while sending this video; check TikTok before trying again.' "
+                "error = 'Bot stopped while sending this video; check ' || "
+                "CASE WHEN platform = 'youtube' THEN 'YouTube' ELSE 'TikTok' END || ' before trying again.' "
                 "WHERE state = 'posting' RETURNING id, discord_user_id, video_name"
             ).fetchall()
         return [(post_id, int(user_id), video_name) for post_id, user_id, video_name in rows]

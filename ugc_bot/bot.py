@@ -24,6 +24,7 @@ from .youtube import (
     YouTubeError,
     authorization_url as youtube_authorization_url,
     validate_metadata as validate_youtube_metadata,
+    validate_short,
 )
 
 
@@ -127,9 +128,9 @@ class CaptionModal(discord.ui.Modal, title="TikTok caption"):
         await interaction.response.send_message("Caption saved for this post.", ephemeral=True)
 
 
-class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
-    def __init__(self, post_view: DirectPostView, panel_message: discord.Message, time_zone: str | None):
-        super().__init__()
+class ScheduleModal(discord.ui.Modal, title="Schedule post"):
+    def __init__(self, post_view: DirectPostView | YouTubePostView, panel_message: discord.Message, time_zone: str | None):
+        super().__init__(title=f"Schedule {post_view.platform_name} post")
         self.post_view = post_view
         self.panel_message = panel_message
         self.time_zone = time_zone
@@ -144,6 +145,11 @@ class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
         self.add_item(self.when)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.post_view.interaction_check(interaction):
+            return
+        if self.post_view.is_finished() or self.post_view.submitted:
+            await interaction.response.send_message("This post is already being sent, scheduled or the panel has expired.", ephemeral=True)
+            return
         if self.post_view.bot.storage.get_time_zone(self.post_view.message.author.id) != self.time_zone:
             await interaction.response.send_message(
                 "Your time zone changed. Open Schedule post again to review the time in the new zone.", ephemeral=True
@@ -165,7 +171,7 @@ class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             post_id = await self.post_view.bot.schedule_direct_video(self.post_view.message, self.post_view, scheduled_at)
-        except (TikTokError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        except (TikTokError, YouTubeError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             self.post_view.submitted = False
             await interaction.followup.send(f"Could not schedule this video: {exc}", ephemeral=True)
             return
@@ -173,7 +179,8 @@ class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
         for item in self.post_view.children:
             item.disabled = True
         await self.panel_message.edit(
-            content=f"Scheduled **{self.post_view.message.attachments[0].filename}** for <t:{scheduled_at}:F> "
+            content=f"Scheduled **{self.post_view.message.attachments[0].filename}** on **{self.post_view.platform_name}** "
+                    f"for <t:{scheduled_at}:F> "
                     f"(ID `{post_id}`; entered in {self.time_zone or 'the supplied UTC offset'}). "
                     "Use `/scheduled` to review or `/cancel-post` to cancel.",
             view=self.post_view,
@@ -182,6 +189,8 @@ class ScheduleModal(discord.ui.Modal, title="Schedule TikTok post"):
 
 
 class DirectPostView(discord.ui.View):
+    platform_name = "TikTok"
+
     def __init__(self, bot: UploadBot, message: discord.Message, creator: dict):
         super().__init__(timeout=600)
         self.bot = bot
@@ -313,8 +322,8 @@ class DirectPostView(discord.ui.View):
         await interaction.response.send_modal(ScheduleModal(self, interaction.message, time_zone))
 
 
-class YouTubeDetailsModal(discord.ui.Modal, title="YouTube video details"):
-    video_title = discord.ui.TextInput(label="Title", max_length=100)
+class YouTubeDetailsModal(discord.ui.Modal, title="YouTube Short details"):
+    video_title = discord.ui.TextInput(label="Short title", max_length=100)
     description = discord.ui.TextInput(label="Description (optional)", style=discord.TextStyle.paragraph,
                                        required=False, max_length=4000)
 
@@ -336,11 +345,15 @@ class YouTubeDetailsModal(discord.ui.Modal, title="YouTube video details"):
         except YouTubeError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
-        self.post_view.title, self.post_view.description = title, description
-        await interaction.response.send_message("YouTube title and description saved for this video.", ephemeral=True)
+        self.post_view.title, self.post_view.description = title.strip(), description
+        await interaction.response.send_message(
+            "YouTube details saved. Choose visibility and whether the video is made for kids, "
+            "then press Post YouTube Short or Schedule YouTube Short.", ephemeral=True)
 
 
 class YouTubePostView(discord.ui.View):
+    platform_name = "YouTube Short"
+
     def __init__(self, bot: UploadBot, message: discord.Message):
         super().__init__(timeout=600)
         self.bot, self.message = bot, message
@@ -349,7 +362,7 @@ class YouTubePostView(discord.ui.View):
         self.privacy: str | None = None
         self.made_for_kids: bool | None = None
         self.submitted = False
-        privacy = discord.ui.Select(placeholder="YouTube: who can see this video?", row=0, options=[
+        privacy = discord.ui.Select(placeholder="YouTube: who can see this Short?", row=0, options=[
             discord.SelectOption(label=name.title(), value=name) for name in ("private", "unlisted", "public")])
 
         async def set_privacy(interaction: discord.Interaction) -> None:
@@ -358,7 +371,7 @@ class YouTubePostView(discord.ui.View):
 
         privacy.callback = set_privacy
         self.add_item(privacy)
-        audience = discord.ui.Select(placeholder="YouTube: is this video made for kids?", row=1, options=[
+        audience = discord.ui.Select(placeholder="YouTube: is this Short made for kids?", row=1, options=[
             discord.SelectOption(label="Yes, made for kids", value="yes"),
             discord.SelectOption(label="No, not made for kids", value="no"),
         ])
@@ -391,10 +404,13 @@ class YouTubePostView(discord.ui.View):
     async def edit_details(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(YouTubeDetailsModal(self))
 
-    @discord.ui.button(label="Post to YouTube", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Post YouTube Short", style=discord.ButtonStyle.primary, row=2)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if self.submitted:
             await interaction.response.send_message("This YouTube video is already being sent.", ephemeral=True)
+            return
+        if not self.title.strip():
+            await interaction.response.send_modal(YouTubeDetailsModal(self))
             return
         error = self.selection_error()
         if error:
@@ -406,6 +422,25 @@ class YouTubePostView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content="Sending your video to YouTube…", view=self)
         await self.bot.post_youtube_video(interaction.message, self.message, self)
+
+    @discord.ui.button(label="Schedule YouTube Short", style=discord.ButtonStyle.secondary, row=2)
+    async def schedule(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.submitted:
+            await interaction.response.send_message("This YouTube video is already being sent or scheduled.", ephemeral=True)
+            return
+        if not self.title.strip():
+            await interaction.response.send_modal(YouTubeDetailsModal(self))
+            return
+        error = self.selection_error()
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        time_zone = self.bot.storage.get_time_zone(self.message.author.id)
+        await interaction.response.send_modal(ScheduleModal(self, interaction.message, time_zone))
+
+    def post_info(self) -> dict:
+        return {"title": self.title, "description": self.description,
+                "privacy": self.privacy, "made_for_kids": self.made_for_kids}
 
 
 class UploadBot(discord.Client):
@@ -492,7 +527,13 @@ class UploadBot(discord.Client):
                     await interaction.followup.send("Could not revoke YouTube access. Try `/unlink-youtube` again.", ephemeral=True)
                     return
                 self.storage.delete_tokens(interaction.user.id, youtube=True)
-            await interaction.followup.send("YouTube disconnected.", ephemeral=True)
+                cancelled = self.storage.cancel_all_scheduled_posts(interaction.user.id, platform="youtube")
+                for video_name in cancelled:
+                    (self.scheduled_dir / video_name).unlink(missing_ok=True)
+            result = "YouTube disconnected."
+            if cancelled:
+                result += f" Cancelled {len(cancelled)} pending YouTube Short(s)."
+            await interaction.followup.send(result, ephemeral=True)
 
         @self.tree.command(name="link-tiktok", description="Connect TikTok for posting and scheduling videos")
         async def link_tiktok(interaction: discord.Interaction) -> None:
@@ -556,7 +597,7 @@ class UploadBot(discord.Client):
                     result += f" Cancelled {len(cancelled)} pending scheduled post(s)."
             await interaction.followup.send(result, ephemeral=True)
 
-        @self.tree.command(name="scheduled", description="See your recent scheduled TikTok posts")
+        @self.tree.command(name="scheduled", description="See your scheduled TikTok posts and YouTube Shorts")
         async def scheduled(interaction: discord.Interaction) -> None:
             posts = self.storage.list_scheduled_posts(interaction.user.id)
             if not posts:
@@ -564,7 +605,8 @@ class UploadBot(discord.Client):
                 return
             await interaction.response.defer(ephemeral=True)
             lines = [
-                f"`{post['id']}` · <t:{post['scheduled_at']}:F> · {post['state']} · "
+                f"`{post['id']}` · {'YouTube Short' if post['platform'] == 'youtube' else 'TikTok'} · "
+                f"<t:{post['scheduled_at']}:F> · {post['state']} · "
                 f"{discord.utils.escape_markdown(discord.utils.escape_mentions(post['original_name']))[:50]}"
                 + (f" · {discord.utils.escape_mentions(post['error'])[:80]}" if post["error"] else "")
                 for post in posts
@@ -577,7 +619,7 @@ class UploadBot(discord.Client):
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="cancel-post", description="Cancel a pending scheduled TikTok post")
+        @self.tree.command(name="cancel-post", description="Cancel a pending TikTok post or YouTube Short")
         @app_commands.describe(post_id="ID shown by /scheduled")
         async def cancel_post(interaction: discord.Interaction, post_id: str) -> None:
             async with self._lock(interaction.user.id):
@@ -672,14 +714,19 @@ class UploadBot(discord.Client):
             if self.youtube is None:
                 await message.reply("YouTube uploads have not been configured by the bot owner.", mention_author=False)
                 return
+            saved_zone = self.storage.get_time_zone(message.author.id)
+            schedule_hint = (
+                f"Scheduling time zone: `{time_zone_display(saved_zone)}`. Use `/set-time-zone` if it is wrong."
+                if saved_zone else
+                "Scheduling time zone: not set. Enter a UTC offset or use `/set-time-zone` first.")
             await message.reply(
-                f"Post **{message.attachments[0].filename}** to your linked **YouTube channel**. "
+                f"Post **{message.attachments[0].filename}** as a **YouTube Short** on your linked channel. "
                 "Use **Edit YouTube details** to enter a title and optional description, then choose visibility "
-                "and whether the video is made for kids. Press **Post to YouTube** when ready. "
-                "Square or vertical videos up to three minutes are eligible for Shorts. "
-                "YouTube determines classification and processes the video after transfer. "
+                "and whether the Short is made for kids. Press **Post YouTube Short** or **Schedule YouTube Short**. "
+                "Only square or vertical videos up to three minutes are accepted. "
+                "The bot uploads scheduled Shorts when due; YouTube processing may delay their appearance. "
                 "This panel posts to YouTube; use the TikTok panel too if you want both. "
-                "Connect TikTok with `/link-tiktok` if needed.",
+                "Connect TikTok with `/link-tiktok` if needed.\n" + schedule_hint,
                 mention_author=False, view=YouTubePostView(self, message))
 
     async def _prepare_tiktok_post(self, message: discord.Message) -> None:
@@ -732,7 +779,7 @@ class UploadBot(discord.Client):
             error = settings.selection_error()
             if error:
                 raise YouTubeError(error)
-            async with self.upload_slots, self._lock(message.author.id):
+            async with self._lock(message.author.id), self.upload_slots:
                 tokens = self.storage.get_tokens(message.author.id, youtube=True)
                 if not tokens:
                     raise YouTubeError("Run /link-youtube to connect your channel first.")
@@ -742,11 +789,12 @@ class UploadBot(discord.Client):
                 with tempfile.TemporaryDirectory(prefix="ugc-bot-youtube-") as directory:
                     path = Path(directory) / ("video" + suffix)
                     await self._download(video, path)
+                    await validate_short(path, self.config.ffprobe_path)
                     video_id = await self.youtube.post_video(tokens["access_token"], path, MIME_TYPES[suffix],
                                                              settings.title, settings.description,
                                                              settings.privacy, settings.made_for_kids)
-            await progress.edit(content=f"Uploaded to YouTube: https://www.youtube.com/watch?v={video_id}\n"
-                                "YouTube is processing the video and determines Shorts eligibility.")
+            await progress.edit(content=f"Short uploaded to YouTube: https://www.youtube.com/shorts/{video_id}\n"
+                                "YouTube is processing it.")
         except (YouTubeError, TikTokError) as exc:
             await progress.edit(content=str(exc))
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
@@ -759,7 +807,7 @@ class UploadBot(discord.Client):
         attachment = message.attachments[0]
         suffix = Path(attachment.filename).suffix.lower()
         mime_type = MIME_TYPES[suffix]
-        async with self.upload_slots, self._lock(message.author.id):
+        async with self._lock(message.author.id), self.upload_slots:
             try:
                 token = await self._access_token(message.author.id)
                 assert self.tiktok is not None
@@ -802,29 +850,44 @@ class UploadBot(discord.Client):
                 await progress.edit(content="Direct post failed due to a network or file error. Please try again.")
 
     async def schedule_direct_video(
-        self, message: discord.Message, settings: DirectPostView, scheduled_at: int
+        self, message: discord.Message, settings: DirectPostView | YouTubePostView, scheduled_at: int
     ) -> str:
+        youtube = isinstance(settings, YouTubePostView)
+        platform = "youtube" if youtube else "tiktok"
+        if youtube:
+            if self.youtube is None:
+                raise YouTubeError("YouTube uploads have not been configured by the bot owner.")
+            error = settings.selection_error()
+            if error:
+                raise YouTubeError(error)
+            post_info = settings.post_info()
+        else:
+            post_info = settings.post_info(settings.creator)
         attachment = message.attachments[0]
         suffix = Path(attachment.filename).suffix.lower()
         post_id = secrets.token_hex(6)
         video_name = post_id + suffix
         path = self.scheduled_dir / video_name
         partial_path = self.scheduled_dir / (video_name + ".part")
-        async with self.upload_slots, self._lock(message.author.id):
-            tokens = self.storage.get_tokens(message.author.id)
-            if not tokens or "video.publish" not in {
+        async with self._lock(message.author.id), self.upload_slots:
+            tokens = self.storage.get_tokens(message.author.id, youtube=youtube)
+            if youtube and not tokens:
+                raise YouTubeError("YouTube is not connected. Run /link-youtube again.")
+            if not youtube and (not tokens or "video.publish" not in {
                 scope.strip() for scope in tokens.get("scope", "").split(",")
-            }:
+            }):
                 raise TikTokError("Direct posting is not connected. Run /link-tiktok again.")
             if self.storage.active_scheduled_count(message.author.id) >= 20:
                 raise TikTokError("You already have 20 pending scheduled posts. Cancel one before adding another.")
             self.scheduled_dir.mkdir(parents=True, exist_ok=True)
             try:
                 await self._download(attachment, partial_path)
+                if youtube:
+                    await validate_short(partial_path, self.config.ffprobe_path)
                 partial_path.replace(path)
                 self.storage.add_scheduled_post(
                     post_id, message.author.id, video_name, attachment.filename,
-                    MIME_TYPES[suffix], settings.post_info(settings.creator), scheduled_at,
+                    MIME_TYPES[suffix], post_info, scheduled_at, platform=platform,
                 )
             except BaseException:
                 partial_path.unlink(missing_ok=True)
@@ -859,6 +922,9 @@ class UploadBot(discord.Client):
             await self._notify_scheduled(user_id, f"Scheduled TikTok post `{post['id']}` failed: {reason}")
 
     async def _process_scheduled_post(self, post: dict) -> None:
+        if post.get("platform") == "youtube":
+            await self._process_scheduled_youtube_post(post)
+            return
         user_id = int(post["discord_user_id"])
         async with self._lock(user_id):
             if post["state"] == "submitted":
@@ -914,13 +980,63 @@ class UploadBot(discord.Client):
             post["publish_id"] = publish_id
             await self._check_scheduled_post(post, token)
 
+    async def _process_scheduled_youtube_post(self, post: dict) -> None:
+        user_id = int(post["discord_user_id"])
+        async with self._lock(user_id):
+            if not self.storage.claim_scheduled_post(post["id"]):
+                return
+            path = self.scheduled_dir / post["video_name"]
+            try:
+                if self.youtube is None:
+                    raise YouTubeError("YouTube uploads are no longer configured.")
+                if not path.is_file():
+                    raise YouTubeError("Saved Short is missing from the bot's storage.")
+                tokens = self.storage.get_tokens(user_id, youtube=True)
+                if not tokens:
+                    raise YouTubeError("YouTube is no longer connected. Run /link-youtube again.")
+                post_info = json.loads(post["post_info"])
+                validate_youtube_metadata(post_info["title"], post_info["description"])
+                if post_info["privacy"] not in {"public", "unlisted", "private"} or not isinstance(post_info["made_for_kids"], bool):
+                    raise YouTubeError("Saved YouTube audience settings are invalid.")
+                async with self.upload_slots:
+                    await validate_short(path, self.config.ffprobe_path)
+                if int(tokens["expires_at"]) <= int(time.time()) + 60:
+                    tokens = await self.youtube.refresh(tokens["refresh_token"])
+                    self.storage.save_tokens(user_id, tokens, youtube=True)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                self.storage.update_scheduled_post(post["id"], "pending", error="Temporary network error; will retry.")
+                return
+            except (YouTubeError, OSError, ValueError, KeyError, TypeError) as exc:
+                reason = str(exc)[:200]
+                self.storage.update_scheduled_post(post["id"], "failed", error=reason)
+                path.unlink(missing_ok=True)
+                await self._notify_scheduled(user_id, f"Scheduled YouTube Short `{post['id']}` failed: {reason}")
+                return
+            try:
+                async with self.upload_slots:
+                    video_id = await self.youtube.post_video(tokens["access_token"], path, post["mime_type"],
+                                                             post_info["title"], post_info["description"],
+                                                             post_info["privacy"], post_info["made_for_kids"])
+            except (YouTubeError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                self.storage.update_scheduled_post(post["id"], "uncertain",
+                    error="Could not confirm whether YouTube received this Short; check your channel before retrying.")
+                path.unlink(missing_ok=True)
+                log.warning("Scheduled YouTube Short %s could not be confirmed: %s", post["id"], exc)
+                await self._notify_scheduled(user_id, f"Scheduled YouTube Short `{post['id']}` may have been sent. "
+                                             "Check your channel before trying again; it will not be retried automatically.")
+                return
+            self.storage.update_scheduled_post(post["id"], "uploaded", publish_id=video_id)
+            path.unlink(missing_ok=True)
+            await self._notify_scheduled(user_id, f"Scheduled YouTube Short `{post['id']}` uploaded: "
+                                         f"https://www.youtube.com/shorts/{video_id}\nYouTube is processing it.")
+
     async def _scheduled_loop(self) -> None:
         await self.wait_until_ready()
         interrupted = self.storage.recover_interrupted_posts()
         for post_id, user_id, video_name in interrupted:
             (self.scheduled_dir / video_name).unlink(missing_ok=True)
             await self._notify_scheduled(
-                user_id, f"Scheduled TikTok post `{post_id}` was interrupted. Check your profile before trying again."
+                user_id, f"Scheduled post `{post_id}` was interrupted. Check the associated platform before trying again."
             )
         while True:
             try:

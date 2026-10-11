@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+import os
+import subprocess
 import time
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -16,10 +21,86 @@ class YouTubeError(Exception):
 
 
 def validate_metadata(title: str, description: str) -> None:
-    if not title.strip() or len(title) > 100 or any(c in title + description for c in "<>"):
-        raise YouTubeError("Use a title of 1–100 characters and no < or > in title or description.")
+    if not title.strip():
+        raise YouTubeError("Enter a YouTube title before posting or scheduling.")
+    if len(title.strip()) > 100:
+        raise YouTubeError("YouTube title must be at most 100 characters.")
+    if any(c in title for c in "<>"):
+        raise YouTubeError("YouTube title cannot contain < or >. Edit YouTube details to remove them.")
+    if any(c in description for c in "<>"):
+        raise YouTubeError("YouTube description cannot contain < or >. Edit YouTube details to remove them.")
     if len(description.encode("utf-8")) > 5000:
         raise YouTubeError("Description must be at most 5000 UTF-8 bytes.")
+
+
+def validate_short_metadata(metadata: dict) -> None:
+    """Check duration and the displayed aspect ratio, including rotation and pixel shape."""
+    try:
+        streams = metadata["streams"]
+        video = next(stream for stream in streams if stream.get("codec_type") == "video"
+                     and not stream.get("disposition", {}).get("attached_pic"))
+        width, height = int(video["width"]), int(video["height"])
+        durations = []
+        for value in [metadata.get("format", {}).get("duration"), *(stream.get("duration") for stream in streams)]:
+            if value in (None, "N/A"):
+                continue
+            duration = float(value)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("Invalid duration")
+            durations.append(duration)
+        if not durations or width <= 0 or height <= 0:
+            raise ValueError("Missing dimensions or duration")
+        pixel_ratio = video.get("sample_aspect_ratio")
+        ratio = Fraction(1) if pixel_ratio in (None, "N/A", "0:1") else Fraction(pixel_ratio.replace(":", "/"))
+        if ratio <= 0:
+            raise ValueError("Invalid pixel aspect ratio")
+        rotation = video.get("tags", {}).get("rotate", 0)
+        for side_data in video.get("side_data_list", []):
+            if "rotation" in side_data:
+                rotation = side_data["rotation"]
+                break
+        rotation = float(rotation) % 360
+        if not math.isfinite(rotation) or abs(rotation / 90 - round(rotation / 90)) > 0.000001:
+            raise ValueError("Unknown display rotation")
+        display_ratio = Fraction(width, height) * ratio
+        if round(rotation / 90) % 2:
+            display_ratio = 1 / display_ratio
+    except (KeyError, ValueError, TypeError, AttributeError, StopIteration, ZeroDivisionError) as exc:
+        raise YouTubeError("Could not verify Shorts duration or dimensions. Re-export the video as an MP4 and try again.") from exc
+    if max(durations) > 180:
+        raise YouTubeError("YouTube Shorts must be at most 3 minutes long. Trim this video before posting or scheduling.")
+    if display_ratio > 1:
+        raise YouTubeError("YouTube Shorts must be square or vertical. Crop or rotate this landscape video before posting or scheduling.")
+
+
+async def validate_short(path: Path, ffprobe_path: str = "ffprobe") -> None:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffprobe_path, "-v", "error", "-protocol_whitelist", "file", "-show_entries",
+            "format=duration:stream=codec_type,width,height,duration,sample_aspect_ratio:"
+            "stream_disposition=attached_pic:stream_tags=rotate:stream_side_data=rotation",
+            "-of", "json", str(path.resolve()), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+        )
+    except OSError as exc:
+        raise YouTubeError("The bot cannot inspect Shorts. Install FFmpeg/ffprobe on the bot host or redeploy with the updated Railway configuration.") from exc
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise YouTubeError("Shorts inspection timed out. Re-export the video as an MP4 and try again.") from exc
+    if process.returncode != 0:
+        raise YouTubeError("Could not read this video. Re-export it as an MP4 and try again.")
+    try:
+        metadata = json.loads(stdout)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise YouTubeError("Could not inspect this video. Re-export it as an MP4 and try again.") from exc
+    validate_short_metadata(metadata)
 
 
 def authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
